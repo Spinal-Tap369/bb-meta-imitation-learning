@@ -1,0 +1,40 @@
+# Byte‐compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+ilenv/
+
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.whl
+
+# Checkpoints, data, logs
+*.ckpt
+bc_pretrainer_ckpts/
+bc_meta_ckpts/
+bc_meta_ckpts_load/
+bc_meta_train/
+dagger/
+demo_recorder/
+mazes_data_try/
+scripts/
+visual_eval/
+readmel.md
+
+# IDE / editor folders and files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
