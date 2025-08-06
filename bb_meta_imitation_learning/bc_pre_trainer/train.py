@@ -11,7 +11,9 @@ from .datasets import (
     DemoDataset, TurnSegmentDataset,
     CollisionSegmentDataset, CornerSegmentDataset, collate_fn
 )
-from snail_trpo.snail_model import SNAILPolicyValueNet
+
+from bb_meta_imitation_learning.snail_trpo.snail_model import SNAILPolicyValueNet
+
 
 def train_bc(
     demo_root, save_path, action_dim, epochs, batch_size,

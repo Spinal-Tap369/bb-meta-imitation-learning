@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from snail_trpo.cnn_encoder import CNNEncoder
+from .cnn_encoder import CNNEncoder
 
 # CombinedEncoder
 class CombinedEncoder(nn.Module):
