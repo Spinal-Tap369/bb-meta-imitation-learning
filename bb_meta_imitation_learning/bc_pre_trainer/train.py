@@ -6,8 +6,8 @@ import json
 from torch.utils.data import DataLoader, random_split, ConcatDataset, WeightedRandomSampler
 from torch import optim, nn
 
-from bc_pre_trainer.utils import SEQ_LEN, PAD_ACTION
-from bc_pre_trainer.datasets import (
+from .utils import SEQ_LEN, PAD_ACTION
+from .datasets import (
     DemoDataset, TurnSegmentDataset,
     CollisionSegmentDataset, CornerSegmentDataset, collate_fn
 )

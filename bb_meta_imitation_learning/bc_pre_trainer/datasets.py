@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from bc_pre_trainer.utils import (
+from .utils import (
     pad_or_truncate,
     PAD_ACTION,
     LEFT_ACTION, RIGHT_ACTION, STRAIGHT_ACTION,

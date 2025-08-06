@@ -8,7 +8,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import argparse
-from bc_pre_trainer.train import train_bc
+from .train import train_bc
 
 def main():
     p = argparse.ArgumentParser("BC Pre-Training w/ turn, collision & corner ups.")
