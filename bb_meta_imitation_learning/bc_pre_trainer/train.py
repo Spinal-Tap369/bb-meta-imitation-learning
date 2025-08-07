@@ -19,14 +19,14 @@ def train_bc(
     demo_root, save_path, action_dim, epochs, batch_size,
     lr, val_ratio, patience_max, seed
 ):
-    # reproducibility
+    # ── reproducibility ─────────────────────────────────────────────────────────
     import random, numpy as np
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark    = False
 
-    # load full demos
+    # ── load full demos ─────────────────────────────────────────────────────────
     mf = os.path.join(demo_root, 'demo_manifest.csv')
     if not os.path.isfile(mf):
         raise FileNotFoundError(f"Missing manifest: {mf}")
@@ -37,7 +37,7 @@ def train_bc(
     n_train  = N_full - n_val
     train_full, val_full = random_split(full_ds, [n_train, n_val])
 
-    # mine segments
+    # ── mine segments ───────────────────────────────────────────────────────────
     turn_ds   = TurnSegmentDataset(demo_dir)
     coll_ds   = CollisionSegmentDataset(demo_dir)
     corner_ds = CornerSegmentDataset(demo_dir)
@@ -47,7 +47,7 @@ def train_bc(
     n_coll   = len(coll_ds)
     n_corner = len(corner_ds)
 
-    # compute mixing weights
+    # ── compute mixing weights ─────────────────────────────────────────────────
     from .utils import (
         TURN_OVERSAMPLE_FRACTION,
         COLLISION_OVERSAMPLE_FRACTION,
@@ -80,8 +80,8 @@ def train_bc(
         collate_fn=collate_fn, num_workers=2, pin_memory=True
     )
 
-    # model, optimizer, loss
-    device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # ── model, optimizer, loss ────────────────────────────────────────────────
+    device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     policy_net = SNAILPolicyValueNet(
         action_dim=action_dim,
         base_dim=256,
@@ -94,12 +94,12 @@ def train_bc(
     optimizer = optim.Adam(policy_net.parameters(), lr=lr)
     loss_fn   = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
 
-    # ——— resume support ———
+    # ── resume support ─────────────────────────────────────────────────────────
     os.makedirs(save_path, exist_ok=True)
-    resume_path = os.path.join(save_path, "pretrain_ckp_load.pth")
-    start_epoch = 1
-    best_val = float('inf')
-    patience  = 0
+    resume_path  = os.path.join(save_path, "pretrain_ckp_load.pth")
+    start_epoch  = 1
+    best_val     = float('inf')
+    patience     = 0
 
     if os.path.isfile(resume_path):
         print(f"[Resuming] loading checkpoint {resume_path}")
@@ -111,12 +111,12 @@ def train_bc(
         patience     = ck.get('patience', patience)
         print(f" → Resumed at epoch {ck['epoch']}, best_val={best_val:.4f}, patience={patience}")
 
-    # outer epoch progress bar
+    # ── training loop w/ tqdm ──────────────────────────────────────────────────
     epoch_bar = tqdm(range(start_epoch, epochs+1), desc="Epoch", unit="ep")
     for epoch in epoch_bar:
-        # training
+        # — training phase
         policy_net.train()
-        acc_loss = 0.0
+        acc_loss  = 0.0
         batch_bar = tqdm(train_loader, desc=f"Train Ep{epoch}", leave=False, unit="batch")
         for obs6, acts in batch_bar:
             obs6, acts = obs6.to(device), acts.to(device)
@@ -129,21 +129,20 @@ def train_bc(
             batch_bar.set_postfix(loss=f"{loss.item():.4f}")
         train_ce = acc_loss / (len(weights) * SEQ_LEN)
 
-        # validation
+        # — validation phase
         policy_net.eval()
         val_loss = 0.0
-        with torch.no_grad():
-            for obs6, acts in tqdm(val_loader, desc=f" Val Ep{epoch}", leave=False, unit="batch"):
-                obs6, acts = obs6.to(device), acts.to(device)
-                logits, _ = policy_net(obs6)
-                l = loss_fn(logits.view(-1, action_dim), acts.view(-1))
-                val_loss += l.item() * acts.numel()
+        for obs6, acts in tqdm(val_loader, desc=f" Val Ep{epoch}", leave=False, unit="batch"):
+            obs6, acts = obs6.to(device), acts.to(device)
+            logits, _ = policy_net(obs6)
+            l = loss_fn(logits.view(-1, action_dim), acts.view(-1))
+            val_loss += l.item() * acts.numel()
         val_ce = val_loss / (n_val * SEQ_LEN)
 
-        # update epoch bar
+        # — update epoch bar with CE metrics
         epoch_bar.set_postfix(train_ce=f"{train_ce:.4f}", val_ce=f"{val_ce:.4f}")
 
-        # save epoch checkpoint + update resume pointer
+        # — checkpoint this epoch & update resume pointer
         ckpt = {
             'epoch':       epoch,
             'model_state': policy_net.state_dict(),
@@ -154,7 +153,7 @@ def train_bc(
         torch.save(ckpt, os.path.join(save_path, f"ckpt_epoch_{epoch}.pth"))
         torch.save(ckpt, resume_path)
 
-        # best‐model?
+        # — best‐model saving & early‐stop logic
         if val_ce < best_val:
             best_val = val_ce
             patience  = 0
@@ -165,7 +164,7 @@ def train_bc(
                 print(f"Early stopping @ epoch {epoch}")
                 break
 
-    # write manifest
+    # ── write manifest ─────────────────────────────────────────────────────────
     manifest = {
         'total_full':        N_full,
         'train_full':        n_full,
