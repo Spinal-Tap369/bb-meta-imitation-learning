@@ -5,13 +5,13 @@ import torch
 import json
 from torch.utils.data import DataLoader, random_split, ConcatDataset, WeightedRandomSampler
 from torch import optim, nn
+from tqdm.auto import tqdm
 
 from .utils import SEQ_LEN, PAD_ACTION
 from .datasets import (
     DemoDataset, TurnSegmentDataset,
     CollisionSegmentDataset, CornerSegmentDataset, collate_fn
 )
-
 from bb_meta_imitation_learning.snail_trpo.snail_model import SNAILPolicyValueNet
 
 
@@ -71,10 +71,14 @@ def train_bc(
     combined = ConcatDataset([train_full, turn_ds, coll_ds, corner_ds])
     sampler  = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
-    train_loader = DataLoader(combined, batch_size=batch_size, sampler=sampler,
-                              collate_fn=collate_fn, num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_full, batch_size=batch_size, shuffle=False,
-                              collate_fn=collate_fn, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(
+        combined, batch_size=batch_size, sampler=sampler,
+        collate_fn=collate_fn, num_workers=2, pin_memory=True
+    )
+    val_loader   = DataLoader(
+        val_full, batch_size=batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=2, pin_memory=True
+    )
 
     # model, optimizer, loss
     device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -90,12 +94,31 @@ def train_bc(
     optimizer = optim.Adam(policy_net.parameters(), lr=lr)
     loss_fn   = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
 
+    # ——— resume support ———
+    os.makedirs(save_path, exist_ok=True)
+    resume_path = os.path.join(save_path, "pretrain_ckp_load.pth")
+    start_epoch = 1
     best_val = float('inf')
     patience  = 0
-    for epoch in range(1, epochs+1):
+
+    if os.path.isfile(resume_path):
+        print(f"[Resuming] loading checkpoint {resume_path}")
+        ck = torch.load(resume_path, map_location=device)
+        policy_net.load_state_dict(ck['model_state'])
+        optimizer.load_state_dict(ck['opt_state'])
+        start_epoch = ck['epoch'] + 1
+        best_val     = ck.get('best_val', best_val)
+        patience     = ck.get('patience', patience)
+        print(f" → Resumed at epoch {ck['epoch']}, best_val={best_val:.4f}, patience={patience}")
+
+    # outer epoch progress bar
+    epoch_bar = tqdm(range(start_epoch, epochs+1), desc="Epoch", unit="ep")
+    for epoch in epoch_bar:
+        # training
         policy_net.train()
         acc_loss = 0.0
-        for obs6, acts in train_loader:
+        batch_bar = tqdm(train_loader, desc=f"Train Ep{epoch}", leave=False, unit="batch")
+        for obs6, acts in batch_bar:
             obs6, acts = obs6.to(device), acts.to(device)
             optimizer.zero_grad()
             logits, _ = policy_net(obs6)
@@ -103,25 +126,38 @@ def train_bc(
             loss.backward()
             optimizer.step()
             acc_loss += loss.item() * acts.numel()
+            batch_bar.set_postfix(loss=f"{loss.item():.4f}")
         train_ce = acc_loss / (len(weights) * SEQ_LEN)
 
         # validation
         policy_net.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for obs6, acts in val_loader:
+            for obs6, acts in tqdm(val_loader, desc=f" Val Ep{epoch}", leave=False, unit="batch"):
                 obs6, acts = obs6.to(device), acts.to(device)
                 logits, _ = policy_net(obs6)
                 l = loss_fn(logits.view(-1, action_dim), acts.view(-1))
                 val_loss += l.item() * acts.numel()
         val_ce = val_loss / (n_val * SEQ_LEN)
 
-        print(f"[Epoch {epoch:02d}] train_ce={train_ce:.4f}  val_ce={val_ce:.4f}")
+        # update epoch bar
+        epoch_bar.set_postfix(train_ce=f"{train_ce:.4f}", val_ce=f"{val_ce:.4f}")
 
+        # save epoch checkpoint + update resume pointer
+        ckpt = {
+            'epoch':       epoch,
+            'model_state': policy_net.state_dict(),
+            'opt_state':   optimizer.state_dict(),
+            'best_val':    best_val,
+            'patience':    patience,
+        }
+        torch.save(ckpt, os.path.join(save_path, f"ckpt_epoch_{epoch}.pth"))
+        torch.save(ckpt, resume_path)
+
+        # best‐model?
         if val_ce < best_val:
             best_val = val_ce
             patience  = 0
-            os.makedirs(save_path, exist_ok=True)
             torch.save(policy_net.state_dict(), os.path.join(save_path, 'bc_best.pth'))
         else:
             patience += 1
@@ -130,22 +166,21 @@ def train_bc(
                 break
 
     # write manifest
-    os.makedirs(save_path, exist_ok=True)
     manifest = {
-        'total_full':       N_full,
-        'train_full':       n_full,
-        'val_full':         n_val,
-        'turn_segments':    n_turn,
-        'collision_segments': n_coll,
-        'corner_segments':  n_corner,
-        'seq_len':          SEQ_LEN,
-        'turn_frac':        T,
-        'coll_frac':        C,
-        'corner_frac':      X
+        'total_full':        N_full,
+        'train_full':        n_full,
+        'val_full':          n_val,
+        'turn_segments':     n_turn,
+        'collision_segments':n_coll,
+        'corner_segments':   n_corner,
+        'seq_len':           SEQ_LEN,
+        'turn_frac':         T,
+        'coll_frac':         C,
+        'corner_frac':       X
     }
     with open(os.path.join(save_path, 'pretrain_manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2)
 
     print(f"[Done] best val_ce={best_val:.4f}")
-    print(f"→ checkpoint: {save_path}/bc_best.pth")
-    print(f"→ manifest:   {save_path}/pretrain_manifest.json")
+    print(f"→ bc_best.pth      in {save_path}")
+    print(f"→ last ckpt for resume: pretrain_ckp_load.pth")
