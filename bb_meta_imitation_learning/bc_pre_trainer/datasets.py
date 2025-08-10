@@ -11,9 +11,27 @@ from .utils import (
     pad_or_truncate,
     PAD_ACTION,
     LEFT_ACTION, RIGHT_ACTION, STRAIGHT_ACTION,
-    MIN_STRAIGHT_RECOVERY, MIN_COLLISION_RECOVERY, MIN_CORNER_STRAIGHT,
+    MIN_STRAIGHT_RECOVERY, MIN_COLLISION_RECOVERY, MIN_CORNER_STRAIGHT, MIN_STRAIGHT_SEGMENT,
     STEP_REWARD, COLLISION_REWARD,
 )
+
+def _augment_like_others(obs):
+    """Apply brightness/noise like before, but return in the SAME dtype (preferably uint8)."""
+    orig_dtype = obs.dtype
+    obs_f = obs.astype(np.float32, copy=False)
+
+    if random.random() < 0.5:
+        factor = np.random.uniform(0.8, 1.2)
+        obs_f = np.clip(obs_f * factor, 0, 255)
+
+    if random.random() < 0.5:
+        noise = np.random.randn(*obs_f.shape) * 5.0
+        obs_f = np.clip(obs_f + noise, 0, 255)
+
+    # Cast back to original dtype (saves memory if uint8)
+    if np.issubdtype(orig_dtype, np.integer):
+        return obs_f.astype(orig_dtype, copy=False)
+    return obs_f  # already float32
 
 class DemoDataset(Dataset):
     def __init__(self, demo_dir: str):
@@ -28,21 +46,16 @@ class DemoDataset(Dataset):
     def __getitem__(self, idx):
         path = self.files[idx]
         data = np.load(path)
-        obs  = data['observations'].astype(np.float32)
+        obs  = data['observations']                 # keep native dtype (likely uint8)
         acts = data['actions'].astype(np.int64)
 
-        # augment
-        if random.random() < 0.5:
-            factor = np.random.uniform(0.8, 1.2)
-            obs = np.clip(obs * factor, 0, 255)
-        if random.random() < 0.5:
-            noise = np.random.randn(*obs.shape) * 5.0
-            obs   = np.clip(obs + noise, 0, 255)
+        obs = _augment_like_others(obs)
 
         return pad_or_truncate(obs, 0), pad_or_truncate(acts, PAD_ACTION)
 
 
 class TurnSegmentDataset(Dataset):
+    """Last forward → rotation burst → >= MIN_STRAIGHT_RECOVERY straights."""
     def __init__(self, demo_dir: str):
         self.segments = []
         for path in sorted(glob.glob(os.path.join(demo_dir, '*.npz'))):
@@ -52,11 +65,9 @@ class TurnSegmentDataset(Dataset):
             i = 1
             while i < T - MIN_STRAIGHT_RECOVERY:
                 if acts[i] in (LEFT_ACTION, RIGHT_ACTION):
-                    # consume rotation burst
                     j = i
                     while j < T and acts[j] in (LEFT_ACTION, RIGHT_ACTION):
                         j += 1
-                    # require straight recovery
                     k, sc = j, 0
                     while k < T and sc < MIN_STRAIGHT_RECOVERY:
                         if acts[k] == STRAIGHT_ACTION:
@@ -65,7 +76,7 @@ class TurnSegmentDataset(Dataset):
                             break
                         k += 1
                     if sc >= MIN_STRAIGHT_RECOVERY:
-                        start, end = i-1, k
+                        start, end = i - 1, k
                         self.segments.append((path, start, end))
                         i = k
                         continue
@@ -81,21 +92,16 @@ class TurnSegmentDataset(Dataset):
     def __getitem__(self, idx):
         path, s, e = self.segments[idx]
         data  = np.load(path)
-        obs   = data['observations'].astype(np.float32)[s:e]
+        obs   = data['observations'][s:e]          # keep native dtype
         acts  = data['actions'].astype(np.int64)[s:e]
 
-        # same augmentations
-        if random.random() < 0.5:
-            factor = np.random.uniform(0.8, 1.2)
-            obs = np.clip(obs * factor, 0, 255)
-        if random.random() < 0.5:
-            noise = np.random.randn(*obs.shape) * 5.0
-            obs   = np.clip(obs + noise, 0, 255)
+        obs = _augment_like_others(obs)
 
         return pad_or_truncate(obs, 0), pad_or_truncate(acts, PAD_ACTION)
 
 
 class CollisionSegmentDataset(Dataset):
+    """Collision reward → >= MIN_COLLISION_RECOVERY step rewards."""
     def __init__(self, demo_dir: str):
         self.segments = []
         for path in sorted(glob.glob(os.path.join(demo_dir, '*.npz'))):
@@ -127,15 +133,10 @@ class CollisionSegmentDataset(Dataset):
     def __getitem__(self, idx):
         path, s, e = self.segments[idx]
         data = np.load(path)
-        obs  = data['observations'].astype(np.float32)[s:e]
+        obs  = data['observations'][s:e]           # keep native dtype
         acts = data['actions'].astype(np.int64)[s:e]
 
-        if random.random() < 0.5:
-            factor = np.random.uniform(0.8, 1.2)
-            obs = np.clip(obs * factor, 0, 255)
-        if random.random() < 0.5:
-            noise = np.random.randn(*obs.shape) * 5.0
-            obs   = np.clip(obs + noise, 0, 255)
+        obs = _augment_like_others(obs)
 
         return pad_or_truncate(obs, 0), pad_or_truncate(acts, PAD_ACTION)
 
@@ -143,31 +144,24 @@ class CollisionSegmentDataset(Dataset):
 from numpy.lib.stride_tricks import sliding_window_view
 
 class CornerSegmentDataset(Dataset):
-    """Mine the last rotation before N straights by sliding-window in NumPy."""
+    """Last rotation before >= MIN_CORNER_STRAIGHT straights."""
     def __init__(self, demo_dir: str, N_forward: int = MIN_CORNER_STRAIGHT):
         self.N = N_forward
         self.segments = []
-
         for path in sorted(glob.glob(os.path.join(demo_dir, '*.npz'))):
             data = np.load(path)
             acts = data['actions']
             T = len(acts)
-            # build a (T-N)×(N+1) view where each row is [a[i], a[i+1], …, a[i+N]]
-            windows = sliding_window_view(acts, window_shape=self.N+1)  # shape (T-N)×(N+1)
-            # we only care about windows where the last N entries are all STRAIGHT
-            straight_mask = (windows[:, 1:] == STRAIGHT_ACTION).all(axis=1)  # length T-N
+            windows = sliding_window_view(acts, window_shape=self.N + 1)
+            straight_mask = (windows[:, 1:] == STRAIGHT_ACTION).all(axis=1)
 
-            # for each index i where straight_mask[i] is True, back up to the last non-rotation
             idxs = np.nonzero(straight_mask)[0]
             for i in idxs:
-                # window starts at acts[i], and the N straights are at i+1…i+N
                 end = i + 1 + self.N
-                # scan backward from i to find the boundary of the rotation burst
                 j = i
                 while j >= 0 and acts[j] in (LEFT_ACTION, RIGHT_ACTION):
                     j -= 1
                 start = j + 1
-                # record segment [start:end]
                 self.segments.append((path, start, end))
 
         if not self.segments:
@@ -180,25 +174,63 @@ class CornerSegmentDataset(Dataset):
     def __getitem__(self, idx):
         path, s, e = self.segments[idx]
         data = np.load(path)
-        obs  = data['observations'].astype(np.float32)[s:e]
+        obs  = data['observations'][s:e]           # keep native dtype
         acts = data['actions'].astype(np.int64)[s:e]
 
-        if random.random() < 0.5:
-            factor = np.random.uniform(0.8, 1.2)
-            obs    = np.clip(obs * factor, 0, 255)
-        if random.random() < 0.5:
-            noise  = np.random.randn(*obs.shape) * 5.0
-            obs    = np.clip(obs + noise, 0, 255)
+        obs = _augment_like_others(obs)
 
         return pad_or_truncate(obs, 0), pad_or_truncate(acts, PAD_ACTION)
 
 
+class StraightSegmentDataset(Dataset):
+    """
+    Pure-straight clips: mines maximal runs of STRAIGHT with length >= MIN_STRAIGHT_SEGMENT.
+    """
+    def __init__(self, demo_dir: str, min_len: int = MIN_STRAIGHT_SEGMENT):
+        self.min_len = min_len
+        self.segments = []
+
+        for path in sorted(glob.glob(os.path.join(demo_dir, '*.npz'))):
+            data = np.load(path)
+            acts = data['actions']
+            T = len(acts)
+            i = 0
+            while i < T:
+                if acts[i] == STRAIGHT_ACTION:
+                    j = i
+                    while j < T and acts[j] == STRAIGHT_ACTION:
+                        j += 1
+                    run_len = j - i
+                    if run_len >= self.min_len:
+                        self.segments.append((path, i, j))
+                    i = j
+                else:
+                    i += 1
+
+        if not self.segments:
+            raise RuntimeError("No straight segments mined")
+        print(f"[StraightSegmentDataset] {len(self.segments)} segments")
+
+    def __len__(self):
+        return len(self.segments)
+
+    def __getitem__(self, idx):
+        path, s, e = self.segments[idx]
+        data = np.load(path)
+        obs  = data['observations'][s:e]           # keep native dtype
+        acts = data['actions'].astype(np.int64)[s:e]
+
+        obs = _augment_like_others(obs)
+
+        return pad_or_truncate(obs, 0), pad_or_truncate(acts, PAD_ACTION)
+
 
 def collate_fn(batch):
     obs_seq, act_seq = zip(*batch)
+    # Convert to float32 & normalize HERE (saves memory in workers)
     np_img = np.stack(obs_seq, 0).astype(np.float32) / 255.0
     B, S, H, W, C = np_img.shape
-    img   = torch.from_numpy(np_img).permute(0,1,4,2,3)
+    img   = torch.from_numpy(np_img).permute(0, 1, 4, 2, 3)
     extra = torch.zeros((B, S, 3, H, W), dtype=torch.float32)
     obs6  = torch.cat([img, extra], dim=2)
     acts  = torch.from_numpy(np.stack(act_seq, 0)).long()
