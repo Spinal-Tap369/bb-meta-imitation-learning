@@ -18,13 +18,13 @@ dist/
 bc_pretrainer_ckpts/
 bc_meta_ckpts/
 bc_meta_ckpts_load/
-bc_meta_train/
 dagger/
 demo_recorder/
 mazes_data_try/
 scripts/
 visual_eval/
 readmel.md
+bc_meta_train.py
 
 # IDE / editor folders and files
 .vscode/
