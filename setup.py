@@ -20,7 +20,7 @@ setup(
     entry_points={
         "console_scripts": [
             "bc-pretrainer=bb_meta_imitation_learning.bc_pre_trainer.main:main",
-            "bc-meta-train=bb_meta_imitation_learning.bc_meta_train.train:run_training()",
+            "bc-meta-train=bb_meta_imitation_learning.bc_meta_train.train:run_training",
         ],
     },
     python_requires=">=3.7",
