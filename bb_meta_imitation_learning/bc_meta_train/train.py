@@ -47,10 +47,10 @@ def _setup_logging():
 # ---------- explore rollout cache ----------
 @dataclass
 class ExploreRollout:
-    obs6: torch.Tensor           # (T,6,H,W) in [0,1]
-    actions: torch.Tensor        # (T,)
-    rewards: torch.Tensor        # (T,)
-    beh_logits: torch.Tensor     # (T,A) logits at collection time
+    obs6: torch.Tensor           # (T,6,H,W) in [0,1]  (kept on device)
+    actions: torch.Tensor        # (T,)                (device)
+    rewards: torch.Tensor        # (T,)                (device)
+    beh_logits: torch.Tensor     # (T,A) logits at collection time (device)
     reuse_count: int             # how many updates we've used this for (this epoch)
 
 def _collect_explore(
@@ -60,7 +60,8 @@ def _collect_explore(
     device,
     max_steps: int = 250,
 ) -> ExploreRollout:
-    """Run phase-1 on-policy in the env and return tensors for RL training."""
+    """Run phase-1 on-policy in the env and return tensors for RL training.
+       Optimized: pre-allocate GPU buffer; no per-step np.stack; keep outputs on device."""
     env.unwrapped.set_task(task_cfg)
     try:
         env.unwrapped.maze_core.randomize_start()
@@ -72,55 +73,52 @@ def _collect_explore(
     done = False
     trunc = False
 
+    # infer spatial size from first obs
+    H, W = obs.shape[0], obs.shape[1]
+
+    # preallocate on GPU
+    states_buf = torch.empty((max_steps, 6, H, W), device=device, dtype=torch.float32)
+    beh_logits_buf: List[torch.Tensor] = []
+    actions_list: List[int] = []
+    rewards_list: List[float] = []
+
     last_a, last_r = 0.0, 0.0
-    prev_p = env.unwrapped.maze_core.phase
-
-    states = []
-    actions = []
-    rewards = []
-    beh_logits = []
-
     steps = 0
     reached = False
 
-    with torch.no_grad():
+    with torch.inference_mode():
         while not done and not trunc and steps < max_steps:
-            cur_p = env.unwrapped.maze_core.phase
-            bb = 0.0  # exploration -> no boundary flips inside explore
-            img = obs.transpose(2, 0, 1).astype(np.float32) / 255.0
-            H, W = img.shape[1], img.shape[2]
-            c3 = np.full((1, H, W), last_a, dtype=np.float32)
-            c4 = np.full((1, H, W), last_r, dtype=np.float32)
-            c5 = np.full((1, H, W), bb, dtype=np.float32)
-            obs6 = np.concatenate([img, c3, c4, c5], axis=0)
-            states.append(obs6)
+            # build obs6 on GPU
+            img = torch.from_numpy(obs.transpose(2, 0, 1)).to(device=device, dtype=torch.float32) / 255.0
+            pa = torch.full((1, H, W), last_a, device=device, dtype=torch.float32)
+            pr = torch.full((1, H, W), last_r, device=device, dtype=torch.float32)
+            bb = torch.zeros((1, H, W), device=device, dtype=torch.float32)  # explore -> 0
+            obs6_t = torch.cat([img, pa, pr, bb], dim=0)
+            states_buf[steps] = obs6_t
 
-            seq = torch.from_numpy(np.stack(states)[None]).float().to(device)   # (1,t,6,H,W)
-            logits, value = policy_net.act_single_step(seq)  # logits: (1,A) or (A,)
-            if logits.dim() == 2:
-                logits_t = logits[0]
-            else:
-                logits_t = logits
+            # policy step on the prefix [:steps+1]
+            seq = states_buf[: steps + 1].unsqueeze(0)  # (1, t, 6,H,W)
+            logits, _ = policy_net.act_single_step(seq)  # logits: (1,A) or (A,)
+            logits_t = logits[0] if logits.dim() == 2 else logits
+            beh_logits_buf.append(logits_t.detach())
 
             action = torch.distributions.Categorical(logits=logits_t).sample().item()
-            beh_logits.append(logits_t.detach().cpu().numpy())
-
             obs, rew, done, trunc, info = env.step(action)
             if env.unwrapped.maze_core.phase_metrics[2]["goal_rewards"] > 0:
                 reached = True
 
-            actions.append(action)
-            rewards.append(float(rew))
+            actions_list.append(action)
+            rewards_list.append(float(rew))
             last_a, last_r = float(action), float(rew)
-            prev_p = cur_p
             steps += 1
             if reached:
                 break
 
-    obs6 = torch.from_numpy(np.stack(states)).float()               # (T,6,H,W)
-    actions = torch.tensor(actions, dtype=torch.long)               # (T,)
-    rewards = torch.tensor(rewards, dtype=torch.float32)            # (T,)
-    beh_logits = torch.from_numpy(np.stack(beh_logits)).float()     # (T,A)
+    # slice to actual length and return on-device tensors
+    obs6 = states_buf[:steps].contiguous()
+    actions = torch.tensor(actions_list, device=device, dtype=torch.long)
+    rewards = torch.tensor(rewards_list, device=device, dtype=torch.float32)
+    beh_logits = torch.stack(beh_logits_buf, dim=0).to(device)
 
     return ExploreRollout(obs6=obs6, actions=actions, rewards=rewards, beh_logits=beh_logits, reuse_count=0)
 
@@ -167,9 +165,9 @@ def _concat_explore_and_exploit(
         exploit_six[0, 5, :, :] = 1.0
 
     obs6_cat = torch.cat([explore_six, exploit_six], dim=0)        # (T,6,H,W)
-    labels_cat = torch.cat([torch.full((Tx,), PAD_ACTION, dtype=torch.long), exploit_labels], dim=0)
-    exp_mask = torch.cat([torch.ones(Tx), torch.zeros(Te)], dim=0)
-    val_mask = torch.ones(Tx + Te)
+    labels_cat = torch.cat([torch.full((Tx,), PAD_ACTION, dtype=torch.long, device=explore_six.device), exploit_labels], dim=0)
+    exp_mask = torch.cat([torch.ones(Tx, device=explore_six.device), torch.zeros(Te, device=explore_six.device)], dim=0)
+    val_mask = torch.ones(Tx + Te, device=explore_six.device)
     return obs6_cat, labels_cat, exp_mask, val_mask
 
 def _kl_ess_should_refresh(
@@ -384,18 +382,18 @@ def run_training():
                 else:
                     # KL-based refresh against current policy
                     with torch.no_grad():
-                        seq = explore_cache[tid].obs6.to(device)  # (Tx,6,H,W)
+                        seq = explore_cache[tid].obs6  # already on device
                         logits_all, values_all = policy_net(seq.unsqueeze(0))  # (1,Tx,A), (1,Tx,?)
                         cur_logits = logits_all[0] if logits_all.dim() == 3 else logits_all
-                        if mean_kl_logits(cur_logits, explore_cache[tid].beh_logits.to(device)).item() > args.kl_refresh_threshold:
+                        if mean_kl_logits(cur_logits, explore_cache[tid].beh_logits).item() > args.kl_refresh_threshold:
                             rollout = _collect_explore(policy_net, env, cfg, device, max_steps=250)
                             explore_cache[tid] = rollout
 
                 # -------- RL on explore chunk (computed ONCE) --------
-                exp_six = explore_cache[tid].obs6.clone()            # (Tx,6,H,W)
+                exp_six = explore_cache[tid].obs6.clone()            # (Tx,6,H,W) on device
                 Tx = exp_six.shape[0]
                 # forward on explore-only to get logits/values for RL
-                logits_x_all, values_x_all = policy_net(exp_six.unsqueeze(0).to(device))
+                logits_x_all, values_x_all = policy_net(exp_six.unsqueeze(0))
                 cur_logits_x = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
                 values_x = values_x_all
                 if values_x.dim() == 3:
@@ -404,9 +402,9 @@ def run_training():
                     values_x = values_x[0]
                 else:
                     values_x = values_x.squeeze()
-                actions_x = explore_cache[tid].actions.to(device)
-                rewards_x = explore_cache[tid].rewards.to(device)
-                beh_logits_x = explore_cache[tid].beh_logits.to(device)
+                actions_x = explore_cache[tid].actions
+                rewards_x = explore_cache[tid].rewards
+                beh_logits_x = explore_cache[tid].beh_logits
 
                 # ESS refresh (based on taken actions)
                 with torch.no_grad():
@@ -420,7 +418,7 @@ def run_training():
                     explore_cache[tid] = rollout
                     exp_six = explore_cache[tid].obs6.clone()
                     Tx = exp_six.shape[0]
-                    logits_x_all, values_x_all = policy_net(exp_six.unsqueeze(0).to(device))
+                    logits_x_all, values_x_all = policy_net(exp_six.unsqueeze(0))
                     cur_logits_x = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
                     values_x = values_x_all
                     if values_x.dim() == 3:
@@ -429,9 +427,9 @@ def run_training():
                         values_x = values_x[0]
                     else:
                         values_x = values_x.squeeze()
-                    actions_x = explore_cache[tid].actions.to(device)
-                    rewards_x = explore_cache[tid].rewards.to(device)
-                    beh_logits_x = explore_cache[tid].beh_logits.to(device)
+                    actions_x = explore_cache[tid].actions
+                    rewards_x = explore_cache[tid].rewards
+                    beh_logits_x = explore_cache[tid].beh_logits
 
                 loss_rl, ent_x, adv_abs = reinforce_with_baseline(
                     cur_logits=cur_logits_x,
@@ -447,48 +445,64 @@ def run_training():
                     is_clip_rho=args.is_clip_rho,
                 )
 
-                # -------- BC on EACH demo (reuse the SAME explore) --------
-                # prev_action_start for demo building = last action from explore (or 0.0 if no steps)
+                # -------- Batched BC over all demos (reuse SAME explore) --------
                 if Tx > 0:
                     prev_action_start = float(explore_cache[tid].actions[-1].item())
                 else:
                     prev_action_start = 0.0
 
-                bc_losses = []
-                # Zero grads once; we'll accumulate losses across demos and step once
-                optimizer.zero_grad()
+                # Build sequences per demo first (explore + demo), then left-pad to same length and batch
+                demo_obs_list: List[torch.Tensor] = []
+                demo_lab_list: List[torch.Tensor] = []
+
                 for demo_path in task["p2_paths"]:
                     p2_six, p2_labels = _load_phase2_six_and_labels(demo_path, prev_action_start=prev_action_start)
                     if p2_six.numel() == 0:
                         continue
+                    # move demo to device before concat (exp_six already on device)
+                    p2_six = p2_six.to(device, non_blocking=True)
+                    p2_labels = p2_labels.to(device, non_blocking=True)
 
-                    obs6_cat, labels_cat, exp_mask, val_mask = _concat_explore_and_exploit(exp_six, p2_six, p2_labels)
-                    obs6_cat = obs6_cat.to(device)
-                    labels_cat = labels_cat.to(device)
+                    obs6_cat, labels_cat, _, _ = _concat_explore_and_exploit(exp_six, p2_six, p2_labels)
+                    demo_obs_list.append(obs6_cat)     # (T_i,6,H,W) on device
+                    demo_lab_list.append(labels_cat)   # (T_i,)      on device
 
-                    # Forward over explore+this-demo to keep memory across boundary
-                    logits, values = policy_net(obs6_cat.unsqueeze(0))
-                    if logits.dim() == 3:
-                        logits = logits[0]
-                    # exploit part
-                    logits_e = logits[Tx:]
-                    labels_e = labels_cat[Tx:]
-                    if args.label_smoothing > 0.0:
-                        loss_bc_i = smoothed_cross_entropy(
-                            logits_e.unsqueeze(0), labels_e.unsqueeze(0),
-                            ignore_index=PAD_ACTION, smoothing=args.label_smoothing
-                        )
-                    else:
-                        ce = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
-                        loss_bc_i = ce(logits_e, labels_e)
-                    bc_losses.append(loss_bc_i)
-
-                if len(bc_losses) == 0:
-                    # No demos? skip update.
+                if len(demo_obs_list) == 0:
                     continue
 
-                # Average BC across demos and combine with RL (computed once)
-                loss_bc = torch.stack(bc_losses).mean()
+                # left-pad to max length and stack -> (B_d, T_max, 6,H,W) and (B_d, T_max)
+                B_d = len(demo_obs_list)
+                T_max = max(x.shape[0] for x in demo_obs_list)
+                H, W = demo_obs_list[0].shape[-2], demo_obs_list[0].shape[-1]
+
+                pad_obs = []
+                pad_lab = []
+                for x, y in zip(demo_obs_list, demo_lab_list):
+                    t = x.shape[0]
+                    if t < T_max:
+                        pad_t = T_max - t
+                        x = torch.cat([torch.zeros((pad_t, 6, H, W), device=device, dtype=x.dtype), x], dim=0)
+                        y = torch.cat([torch.full((pad_t,), PAD_ACTION, device=device, dtype=y.dtype), y], dim=0)
+                    pad_obs.append(x)
+                    pad_lab.append(y)
+
+                batch_obs = torch.stack(pad_obs, dim=0)  # (B_d, T_max, 6,H,W) on device
+                batch_lab = torch.stack(pad_lab, dim=0)  # (B_d, T_max)       on device
+
+                optimizer.zero_grad()
+
+                # single forward for all demos
+                logits_b, _ = policy_net(batch_obs)      # (B_d, T_max, A)
+                if args.label_smoothing > 0.0:
+                    loss_bc = smoothed_cross_entropy(
+                        logits_b, batch_lab,
+                        ignore_index=PAD_ACTION, smoothing=args.label_smoothing
+                    )
+                else:
+                    ce = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
+                    loss_bc = ce(logits_b.reshape(-1, logits_b.size(-1)), batch_lab.reshape(-1))
+
+                # Combine losses and step
                 loss = args.rl_coef * loss_rl + loss_bc
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
