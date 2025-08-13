@@ -31,6 +31,7 @@ from .utils import (
     build_six_from_demo_sequence,
 )
 from .rl_loss import reinforce_with_baseline, mean_kl_logits, ess_ratio_from_rhos
+from .phase1_shaping import Phase1ShapingWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +63,10 @@ def _collect_explore(
     max_steps: int = 250,
 ) -> ExploreRollout:
     """Run phase-1 on-policy in the env and return tensors for RL training.
-       Optimized: pre-allocate GPU buffer; no per-step np.stack; compute on GPU
-       then MOVE RESULTS BACK TO CPU for caching."""
+       Uses the fixed (start, goal) from the task config. Pre-allocates on GPU,
+       then moves results back to CPU for caching."""
+    # Use the task's fixed start/goal (from train_trials.json / manifest)
     env.unwrapped.set_task(task_cfg)
-    try:
-        env.unwrapped.maze_core.randomize_start()
-        env.unwrapped.maze_core.randomize_goal(min_distance=3.0)
-    except Exception:
-        pass
 
     obs, _ = env.reset()
     done = False
@@ -106,8 +103,14 @@ def _collect_explore(
 
             action = torch.distributions.Categorical(logits=logits_t).sample().item()
             obs, rew, done, trunc, info = env.step(action)
-            if env.unwrapped.maze_core.phase_metrics[2]["goal_rewards"] > 0:
-                reached = True
+
+            # goal reached check (if env exposes phase_metrics)
+            if getattr(env.unwrapped, "maze_core", None) is not None:
+                try:
+                    if env.unwrapped.maze_core.phase_metrics[2]["goal_rewards"] > 0:
+                        reached = True
+                except Exception:
+                    pass
 
             actions_list.append(action)
             rewards_list.append(float(rew))
@@ -138,6 +141,38 @@ def _first_demo_paths(ex_record_list: List[Dict], demo_root: str) -> List[str]:
     demos_p2 = [r for r in ex_record_list if int(r.get("phase", 2)) == 2]
     demos_p2 = sorted(demos_p2, key=lambda r: r["frames"])
     return [os.path.join(demo_root, r["file"]) for r in demos_p2]
+
+# ---------- manifest/trial start-goal consistency ----------
+def _manifest_p2_pairs(recs: List[Dict]) -> List[Tuple[int, int, int, int]]:
+    pairs = []
+    for r in recs:
+        if int(r.get("phase", 2)) != 2:
+            continue
+        sx, sy = r.get("start_x"), r.get("start_y")
+        gx, gy = r.get("goal_x"), r.get("goal_y")
+        if sx is None or sy is None or gx is None or gy is None:
+            continue
+        pairs.append((int(sx), int(sy), int(gx), int(gy)))
+    return pairs
+
+def _assert_start_goal_match(recs: List[Dict], tdict: Dict, tid: int):
+    pairs = _manifest_p2_pairs(recs)
+    if not pairs:
+        return
+    uniq = {pairs[0]}
+    for p in pairs[1:]:
+        uniq.add(p)
+    if len(uniq) > 1:
+        raise RuntimeError(
+            f"[TASK {tid}] Demo manifest contains multiple (start,goal) pairs for phase-2: {sorted(list(uniq))}"
+        )
+    msx, msy, mgx, mgy = pairs[0]
+    ts = tuple(tdict.get("start", (None, None)))
+    tg = tuple(tdict.get("goal", (None, None)))
+    if ts != (msx, msy) or tg != (mgx, mgy):
+        raise RuntimeError(
+            f"[TASK {tid}] train_trials.json start/goal {ts}->{tg} do not match manifest {(msx, msy)}->{(mgx, mgy)}"
+        )
 
 def _load_phase2_six_and_labels(demo_path: str, prev_action_start: float) -> Tuple[torch.Tensor, torch.Tensor]:
     d = np.load(demo_path)
@@ -175,6 +210,22 @@ def _kl_ess_should_refresh(cur_logits: torch.Tensor, beh_logits: torch.Tensor,
     if kl > kl_thr:
         return True
     return False
+
+def _make_base_env():
+    """Create a raw MetaMazeDiscrete3D env (no shaping)."""
+    try:
+        env = gym.make("MetaMazeDiscrete3D-v0", enable_render=False)
+    except ModuleNotFoundError:
+        import importlib
+        try:
+            pkg = importlib.import_module("bb_meta_imitation_learning.env")
+            sys.modules.setdefault("env", pkg)
+            sys.modules.setdefault("env.maze_env", importlib.import_module("bb_meta_imitation_learning.env.maze_env"))
+            env = gym.make("MetaMazeDiscrete3D-v0", enable_render=False)
+        except Exception:
+            from bb_meta_imitation_learning.env.maze_env import MetaMazeDiscrete3D
+            env = MetaMazeDiscrete3D(enable_render=False)
+    return env
 
 def run_training():
     args = parse_args()
@@ -216,6 +267,10 @@ def run_training():
             tdict = task_hash_to_dict[tid]
         else:
             continue
+
+        # Ensure the (start, goal) in the trial match the manifest for this task
+        _assert_start_goal_match(recs, tdict, tid)
+
         p2_paths = _first_demo_paths(recs, args.demo_root)
         if len(p2_paths) == 0:
             continue
@@ -286,21 +341,13 @@ def run_training():
     best_epoch = start_epoch
     logger.info(f"[RESUME] from epoch {start_epoch + 1}")
 
-    # Envs
-    try:
-        env = gym.make("MetaMazeDiscrete3D-v0", enable_render=False)
-    except ModuleNotFoundError:
-        import importlib
-        try:
-            pkg = importlib.import_module("bb_meta_imitation_learning.env")
-            sys.modules.setdefault("env", pkg)
-            sys.modules.setdefault("env.maze_env", importlib.import_module("bb_meta_imitation_learning.env.maze_env"))
-            env = gym.make("MetaMazeDiscrete3D-v0", enable_render=False)
-        except Exception:
-            from bb_meta_imitation_learning.env.maze_env import MetaMazeDiscrete3D
-            env = MetaMazeDiscrete3D(enable_render=False)
-    env.action_space.seed(args.seed)
-    val_env = env  # reuse
+    # Envs: wrapped train env (shaping on), plain val env (no shaping)
+    train_env = _make_base_env()
+    train_env = Phase1ShapingWrapper(train_env)  # shaping only influences phase-1
+    train_env.action_space.seed(args.seed)
+
+    val_env = _make_base_env()
+    val_env.action_space.seed(args.seed)
 
     patience = 0
     improved = False
@@ -353,7 +400,7 @@ def run_training():
 
                 # Ensure we have a fresh or valid explore rollout (cache lives on CPU)
                 if tid not in explore_cache or explore_cache[tid].reuse_count >= args.explore_reuse_M:
-                    rollout = _collect_explore(policy_net, env, cfg, device, max_steps=250)
+                    rollout = _collect_explore(policy_net, train_env, cfg, device, max_steps=250)
                     explore_cache[tid] = rollout
                 else:
                     # KL-based refresh against current policy (copy CPU->GPU just for check)
@@ -362,7 +409,7 @@ def run_training():
                         logits_all, _ = policy_net(seq_dev)  # (1,Tx,A)
                         cur_logits = logits_all[0] if logits_all.dim() == 3 else logits_all
                         if mean_kl_logits(cur_logits, explore_cache[tid].beh_logits.to(device)).item() > args.kl_refresh_threshold:
-                            rollout = _collect_explore(policy_net, env, cfg, device, max_steps=250)
+                            rollout = _collect_explore(policy_net, train_env, cfg, device, max_steps=250)
                             explore_cache[tid] = rollout
                     # free temp GPU copy
                     del seq_dev, logits_all, cur_logits
@@ -396,7 +443,7 @@ def run_training():
                     ess_ratio = ess_ratio_from_rhos(rhos).item()
                 if args.explore_reuse_M > 1 and ess_ratio < args.ess_refresh_ratio:
                     # recollect explore and recompute
-                    rollout = _collect_explore(policy_net, env, cfg, device, max_steps=250)
+                    rollout = _collect_explore(policy_net, train_env, cfg, device, max_steps=250)
                     explore_cache[tid] = rollout
                     # refresh dev copies
                     exp_six_dev  = explore_cache[tid].obs6.to(device, non_blocking=True)
@@ -550,4 +597,3 @@ def run_training():
 
 if __name__ == "__main__":
     run_training()
-
