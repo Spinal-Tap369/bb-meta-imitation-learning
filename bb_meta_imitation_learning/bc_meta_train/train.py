@@ -377,7 +377,7 @@ def run_training():
                 beh_logits_x = explore_cache[tid].beh_logits.to(device, non_blocking=True)
                 Tx = exp_six_dev.shape[0]
 
-                with autocast(enabled=use_amp):
+                with autocast(device_type="cuda", enabled=use_amp):
                     logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
                     cur_logits_x = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
                     values_x = values_x_all
@@ -404,7 +404,7 @@ def run_training():
                     rewards_x    = explore_cache[tid].rewards.to(device, non_blocking=True)
                     beh_logits_x = explore_cache[tid].beh_logits.to(device, non_blocking=True)
                     Tx = exp_six_dev.shape[0]
-                    with autocast(enabled=use_amp):
+                    with autocast(device_type="cuda", enabled=use_amp):
                         logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
                         cur_logits_x = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
                         values_x = values_x_all
@@ -415,7 +415,7 @@ def run_training():
                         else:
                             values_x = values_x.squeeze()
 
-                with autocast(enabled=use_amp):
+                with autocast(device_type="cuda", enabled=use_amp):
                     loss_rl, ent_x, adv_abs = reinforce_with_baseline(
                         cur_logits=cur_logits_x,
                         actions=actions_x,
@@ -473,7 +473,7 @@ def run_training():
 
                 # ---- optimize ----
                 optimizer.zero_grad(set_to_none=True)
-                with autocast(enabled=use_amp):
+                with autocast(device_type="cuda", enabled=use_amp):
                     logits_b, _ = policy_net(batch_obs)      # (B_d, T_max, A)
                     if args.label_smoothing > 0.0:
                         loss_bc = smoothed_cross_entropy(
