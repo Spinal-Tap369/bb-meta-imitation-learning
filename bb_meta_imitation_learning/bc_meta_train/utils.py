@@ -261,40 +261,43 @@ def load_all_manifests(demo_root: str) -> Dict[int, List[Dict]]:
 
 
 def eval_sampled_val(policy_net, val_task_entries, env, device, sample_n=3, max_steps=MAX_VALIDATION_STEPS):
-    """Roll out on sampled validation tasks and aggregate metrics."""
+    """Roll out on sampled validation tasks and aggregate metrics.
+
+    Boundary channel (index 5) is 1.0 for all timesteps that occur in phase 2,
+    and 0.0 in phase 1. Start/goal are NOT randomized — they come from the task config.
+    """
     policy_net.eval()
     sampled = random.sample(val_task_entries, min(sample_n, len(val_task_entries)))
     results = []
+
     with torch.no_grad():
         pbar = tqdm(sampled, desc="validation", leave=False)
         for ex in pbar:
             tid = ex["task_id"]
             cfg = MazeTaskManager.TaskConfig(**ex["task_dict"])
-            env.unwrapped.set_task(cfg)
-            try:
-                env.unwrapped.maze_core.randomize_start()
-                env.unwrapped.maze_core.randomize_goal(min_distance=3.0)
-            except Exception:
-                pass
+            env.unwrapped.set_task(cfg)  # fixed start/goal from train_trials.json
 
             obs, _ = env.reset()
             done, trunc = False, False
             last_a, last_r = 0.0, 0.0
             steps = 0
-            states = []
             reached = False
-            prev_p = env.unwrapped.maze_core.phase
+
+            states = []  # (t, 6, H, W)
 
             while not done and not trunc and steps < max_steps:
                 cur_p = env.unwrapped.maze_core.phase
-                bb = 1.0 if (prev_p == 1 and cur_p == 2) else 0.0
-                img = obs.transpose(2, 0, 1)
+                bb = 1.0 if cur_p == 2 else 0.0  # persistent phase-2 boundary bit
+
+                img = obs.transpose(2, 0, 1).astype(np.float32)  # (3, H, W)
                 H, W = img.shape[1], img.shape[2]
-                c3, c4, c5 = [np.full((1, H, W), v, dtype=np.float32) for v in (last_a, last_r, bb)]
+                c3 = np.full((1, H, W), last_a, dtype=np.float32)  # prev action
+                c4 = np.full((1, H, W), last_r, dtype=np.float32)  # prev reward
+                c5 = np.full((1, H, W), bb,     dtype=np.float32)  # boundary bit
                 obs6 = np.concatenate([img, c3, c4, c5], axis=0)
                 states.append(obs6)
 
-                seq = torch.from_numpy(np.stack(states)[None]).float().to(device)
+                seq = torch.from_numpy(np.stack(states, axis=0)[None]).float().to(device)  # (1, t, 6, H, W)
                 logits, _ = policy_net.act_single_step(seq)
                 action = torch.distributions.Categorical(logits=logits).sample().item()
 
@@ -303,7 +306,6 @@ def eval_sampled_val(policy_net, val_task_entries, env, device, sample_n=3, max_
                     reached = True
 
                 last_a, last_r = float(action), float(rew)
-                prev_p = cur_p
                 steps += 1
                 if reached:
                     break
@@ -331,8 +333,8 @@ def eval_sampled_val(policy_net, val_task_entries, env, device, sample_n=3, max_
 
     phase1s = [r["phase1"] for r in results]
     phase2s = [r["phase2"] for r in results]
-    totals = [r["total_steps"] for r in results]
-    succs = [r["success"] for r in results]
+    totals  = [r["total_steps"] for r in results]
+    succs   = [r["success"] for r in results]
 
     return (
         results,

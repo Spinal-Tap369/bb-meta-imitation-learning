@@ -25,6 +25,7 @@ scripts/
 visual_eval/
 readmel.md
 bc_meta_train.py
+test.ipynb
 
 # IDE / editor folders and files
 .vscode/

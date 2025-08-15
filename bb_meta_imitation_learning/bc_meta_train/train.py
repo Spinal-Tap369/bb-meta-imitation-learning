@@ -65,7 +65,6 @@ def _collect_explore(
     """Run phase-1 on-policy in the env and return tensors for RL training.
        Uses the fixed (start, goal) from the task config. Pre-allocates on GPU,
        then moves results back to CPU for caching."""
-    # Use the task's fixed start/goal (from train_trials.json / manifest)
     env.unwrapped.set_task(task_cfg)
 
     obs, _ = env.reset()
@@ -193,7 +192,7 @@ def _concat_explore_and_exploit(
 
     exploit_six = exploit_six.clone()
     if Te > 0:
-        exploit_six[0, 5, :, :] = 1.0
+        exploit_six[:, 5, :, :] = 1.0
 
     obs6_cat = torch.cat([explore_six, exploit_six], dim=0)        # (T,6,H,W)
     labels_cat = torch.cat(
@@ -203,13 +202,6 @@ def _concat_explore_and_exploit(
     exp_mask = torch.cat([torch.ones(Tx, device=explore_six.device), torch.zeros(Te, device=explore_six.device)], dim=0)
     val_mask = torch.ones(Tx + Te, device=explore_six.device)
     return obs6_cat, labels_cat, exp_mask, val_mask
-
-def _kl_ess_should_refresh(cur_logits: torch.Tensor, beh_logits: torch.Tensor,
-                           kl_thr: float, ess_thr: float, is_clip_rho: float) -> bool:
-    kl = mean_kl_logits(cur_logits.detach(), beh_logits.detach()).item()
-    if kl > kl_thr:
-        return True
-    return False
 
 def _make_base_env():
     """Create a raw MetaMazeDiscrete3D env (no shaping)."""
@@ -231,6 +223,12 @@ def run_training():
     args = parse_args()
     _setup_logging()
     start_time = datetime.datetime.utcnow()
+
+    # —— New knobs (safe defaults if not present in config) ——
+    nbc = int(getattr(args, "nbc", 8))  # number of BC (outer) steps per collected explore
+    bc_only_after_first = bool(getattr(args, "bc_only_after_first", False))  # do RL only on k==0
+    # If you prefer to recompute RL each outer step (closer to MRI), set this True
+    recompute_rl_each_outer = bool(getattr(args, "recompute_rl_each_outer", True))
 
     # Seeding
     random.seed(args.seed); np.random.seed(args.seed)
@@ -405,69 +403,44 @@ def run_training():
                 else:
                     # KL-based refresh against current policy (copy CPU->GPU just for check)
                     with torch.no_grad():
-                        seq_dev = explore_cache[tid].obs6.to(device, non_blocking=True).unsqueeze(0)
-                        logits_all, _ = policy_net(seq_dev)  # (1,Tx,A)
-                        cur_logits = logits_all[0] if logits_all.dim() == 3 else logits_all
-                        if mean_kl_logits(cur_logits, explore_cache[tid].beh_logits.to(device)).item() > args.kl_refresh_threshold:
+                        seq_dev_tmp = explore_cache[tid].obs6.to(device, non_blocking=True).unsqueeze(0)
+                        logits_all_tmp, _ = policy_net(seq_dev_tmp)  # (1,Tx,A)
+                        cur_logits_tmp = logits_all_tmp[0] if logits_all_tmp.dim() == 3 else logits_all_tmp
+                        if mean_kl_logits(cur_logits_tmp, explore_cache[tid].beh_logits.to(device)).item() > args.kl_refresh_threshold:
                             rollout = _collect_explore(policy_net, train_env, cfg, device, max_steps=250)
                             explore_cache[tid] = rollout
                     # free temp GPU copy
-                    del seq_dev, logits_all, cur_logits
+                    try:
+                        del seq_dev_tmp, logits_all_tmp, cur_logits_tmp
+                    except NameError:
+                        pass
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
 
-                # -------- RL on explore chunk (computed ONCE) --------
-                # CPU->GPU just for this step
-                exp_six_dev  = explore_cache[tid].obs6.to(device, non_blocking=True)
-                actions_x    = explore_cache[tid].actions.to(device, non_blocking=True)
-                rewards_x    = explore_cache[tid].rewards.to(device, non_blocking=True)
-                beh_logits_x = explore_cache[tid].beh_logits.to(device, non_blocking=True)
+                # -------- Copy explore chunk to device --------
+                exp_six_dev  = explore_cache[tid].obs6.to(device, non_blocking=True)      # (Tx,6,H,W)
+                actions_x    = explore_cache[tid].actions.to(device, non_blocking=True)   # (Tx,)
+                rewards_x    = explore_cache[tid].rewards.to(device, non_blocking=True)   # (Tx,)
+                beh_logits_x = explore_cache[tid].beh_logits.to(device, non_blocking=True)# (Tx,A)
                 Tx = exp_six_dev.shape[0]
 
+                # -------- Precompute RL once (k=0), optional recompute later --------
                 with autocast(device_type="cuda", enabled=use_amp):
                     logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
-                    cur_logits_x = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
-                    values_x = values_x_all
-                    if values_x.dim() == 3:
-                        values_x = values_x[0, :, 0]
-                    elif values_x.dim() == 2:
-                        values_x = values_x[0]
+                    cur_logits_x0 = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
+                    values_x0 = values_x_all
+                    if values_x0.dim() == 3:
+                        values_x0 = values_x0[0, :, 0]
+                    elif values_x0.dim() == 2:
+                        values_x0 = values_x0[0]
                     else:
-                        values_x = values_x.squeeze()
+                        values_x0 = values_x0.squeeze()
 
-                # ESS refresh (based on taken actions)
-                with torch.no_grad():
-                    lp_cur = torch.log_softmax(cur_logits_x, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
-                    lp_beh = torch.log_softmax(beh_logits_x, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
-                    rhos = torch.exp(lp_cur - lp_beh)
-                    ess_ratio = ess_ratio_from_rhos(rhos).item()
-                if args.explore_reuse_M > 1 and ess_ratio < args.ess_refresh_ratio:
-                    # recollect explore and recompute
-                    rollout = _collect_explore(policy_net, train_env, cfg, device, max_steps=250)
-                    explore_cache[tid] = rollout
-                    # refresh dev copies
-                    exp_six_dev  = explore_cache[tid].obs6.to(device, non_blocking=True)
-                    actions_x    = explore_cache[tid].actions.to(device, non_blocking=True)
-                    rewards_x    = explore_cache[tid].rewards.to(device, non_blocking=True)
-                    beh_logits_x = explore_cache[tid].beh_logits.to(device, non_blocking=True)
-                    Tx = exp_six_dev.shape[0]
-                    with autocast(device_type="cuda", enabled=use_amp):
-                        logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
-                        cur_logits_x = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
-                        values_x = values_x_all
-                        if values_x.dim() == 3:
-                            values_x = values_x[0, :, 0]
-                        elif values_x.dim() == 2:
-                            values_x = values_x[0]
-                        else:
-                            values_x = values_x.squeeze()
-
-                with autocast(device_type="cuda", enabled=use_amp):
-                    loss_rl, ent_x, adv_abs = reinforce_with_baseline(
-                        cur_logits=cur_logits_x,
+                    loss_rl_0, ent_x_0, adv_abs_0 = reinforce_with_baseline(
+                        cur_logits=cur_logits_x0,
                         actions=actions_x,
                         rewards=rewards_x,
-                        values=values_x,
+                        values=values_x0,
                         gamma=args.gamma,
                         lam=args.gae_lambda,
                         use_gae=args.use_gae,
@@ -477,13 +450,13 @@ def run_training():
                         is_clip_rho=args.is_clip_rho,
                     )
 
-                # -------- Batched BC over all demos (reuse SAME explore) --------
+                # -------- Build batched BC tensors from ALL demos (once) --------
                 prev_action_start = float(actions_x[-1].item()) if Tx > 0 else 0.0
 
                 demo_obs_list: List[torch.Tensor] = []
                 demo_lab_list: List[torch.Tensor] = []
 
-                # Build on GPU, but we'll free right after the step
+                # Build on GPU, then reused for all nbc steps
                 for demo_path in task["p2_paths"]:
                     p2_six, p2_labels = _load_phase2_six_and_labels(demo_path, prev_action_start=prev_action_start)
                     if p2_six.numel() == 0:
@@ -496,7 +469,11 @@ def run_training():
 
                 if len(demo_obs_list) == 0:
                     # free explore dev copies before continue
-                    del exp_six_dev, actions_x, rewards_x, beh_logits_x, logits_x_all, values_x_all, cur_logits_x, values_x
+                    del exp_six_dev, actions_x, rewards_x, beh_logits_x
+                    try:
+                        del logits_x_all, values_x_all, cur_logits_x0, values_x0
+                    except NameError:
+                        pass
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                     continue
@@ -518,50 +495,94 @@ def run_training():
                 batch_obs = torch.stack(pad_obs, dim=0)  # (B_d, T_max, 6,H,W)
                 batch_lab = torch.stack(pad_lab, dim=0)  # (B_d, T_max)
 
-                # ---- optimize ----
-                optimizer.zero_grad(set_to_none=True)
-                with autocast(device_type="cuda", enabled=use_amp):
-                    logits_b, _ = policy_net(batch_obs)      # (B_d, T_max, A)
-                    if args.label_smoothing > 0.0:
-                        loss_bc = smoothed_cross_entropy(
-                            logits_b, batch_lab,
-                            ignore_index=PAD_ACTION, smoothing=args.label_smoothing
-                        )
-                    else:
-                        ce = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
-                        loss_bc = ce(logits_b.reshape(-1, logits_b.size(-1)), batch_lab.reshape(-1))
+                # ---- MULTIPLE OUTER (BC) STEPS reusing the SAME explore ----
+                for k in range(nbc):
+                    optimizer.zero_grad(set_to_none=True)
 
-                    loss = args.rl_coef * loss_rl + loss_bc
+                    with autocast(device_type="cuda", enabled=use_amp):
+                        # Decide RL contribution this step
+                        if k == 0 and bc_only_after_first:
+                            loss_rl_k, ent_x_k = loss_rl_0, ent_x_0
+                        elif not bc_only_after_first and not recompute_rl_each_outer:
+                            # reuse the k=0 RL each step
+                            loss_rl_k, ent_x_k = loss_rl_0, ent_x_0
+                        elif recompute_rl_each_outer:
+                            # recompute RL against SAME explore each outer step (closer to MRI)
+                            logits_x_all_k, values_x_all_k = policy_net(exp_six_dev.unsqueeze(0))
+                            cur_logits_x_k = logits_x_all_k[0] if logits_x_all_k.dim() == 3 else logits_x_all_k
+                            values_x_k = values_x_all_k
+                            if values_x_k.dim() == 3:
+                                values_x_k = values_x_k[0, :, 0]
+                            elif values_x_k.dim() == 2:
+                                values_x_k = values_x_k[0]
+                            else:
+                                values_x_k = values_x_k.squeeze()
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                            loss_rl_k, ent_x_k, _ = reinforce_with_baseline(
+                                cur_logits=cur_logits_x_k,
+                                actions=actions_x,
+                                rewards=rewards_x,
+                                values=values_x_k,
+                                gamma=args.gamma,
+                                lam=args.gae_lambda,
+                                use_gae=args.use_gae,
+                                entropy_coef=args.explore_entropy_coef,
+                                behavior_logits=beh_logits_x if args.offpolicy_correction != "none" else None,
+                                offpolicy=args.offpolicy_correction,
+                                is_clip_rho=args.is_clip_rho,
+                            )
+                        else:
+                            # BC-only step (k>0)
+                            loss_rl_k = torch.tensor(0.0, device=device, dtype=torch.float32)
+                            ent_x_k = 0.0
 
-                # bump reuse count and logs
-                explore_cache[tid].reuse_count += 1
-                running_train_loss += float(loss.detach().cpu())
-                running_bc += float(loss_bc.detach().cpu())
-                running_rl += float(loss_rl.detach().cpu())
-                running_ent += float(ent_x)
-                count_updates += 1
-                updates_since_free += 1
+                        # BC on demos (reuse same batch each outer step)
+                        logits_b, _ = policy_net(batch_obs)  # (B_d, T_max, A)
+                        if args.label_smoothing > 0.0:
+                            loss_bc_k = smoothed_cross_entropy(
+                                logits_b, batch_lab,
+                                ignore_index=PAD_ACTION, smoothing=args.label_smoothing
+                            )
+                        else:
+                            ce = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
+                            loss_bc_k = ce(logits_b.reshape(-1, logits_b.size(-1)), batch_lab.reshape(-1))
+
+                        loss_k = args.rl_coef * loss_rl_k + loss_bc_k
+
+                    scaler.scale(loss_k).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    # update logs
+                    running_train_loss += float(loss_k.detach().cpu())
+                    running_bc         += float(loss_bc_k.detach().cpu())
+                    running_rl         += float(loss_rl_k.detach().cpu())
+                    running_ent        += float(ent_x_k)
+                    count_updates      += 1
+                    updates_since_free += 1
+
+                    # count reuse of explore (so refresh gates work)
+                    explore_cache[tid].reuse_count += 1
+
+                    if device.type == "cuda" and updates_since_free >= free_every:
+                        torch.cuda.empty_cache()
+                        updates_since_free = 0
 
                 # ---- free big tensors ASAP ----
                 del (exp_six_dev, actions_x, rewards_x, beh_logits_x,
-                     logits_x_all, values_x_all, cur_logits_x, values_x,
+                     logits_x_all, values_x_all, cur_logits_x0, values_x0,
                      demo_obs_list, demo_lab_list, pad_obs, pad_lab,
-                     batch_obs, batch_lab, logits_b, loss_bc, loss)
-                if device.type == "cuda" and updates_since_free >= free_every:
+                     batch_obs, batch_lab, logits_b, loss_bc_k, loss_k)
+                if device.type == "cuda":
                     torch.cuda.empty_cache()
-                    updates_since_free = 0
 
             if count_updates > 0:
-                pbar.set_postfix(loss=f"{running_train_loss/count_updates:.3f}",
-                                 bc=f"{running_bc/count_updates:.3f}",
-                                 rl=f"{running_rl/count_updates:.3f}",
-                                 ent=f"{running_ent/count_updates:.3f}")
+                pbar.set_postfix(loss=f"{running_train_loss/max(1,count_updates):.3f}",
+                                 bc=f"{running_bc/max(1,count_updates):.3f}",
+                                 rl=f"{running_rl/max(1,count_updates):.3f}",
+                                 ent=f"{running_ent/max(1,count_updates):.3f}")
 
         # ------- Validation (rollout) -------
         policy_net.eval()
