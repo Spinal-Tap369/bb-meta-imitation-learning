@@ -29,8 +29,8 @@ from .utils import (
     PAD_ACTION,
     smoothed_cross_entropy,
     build_six_from_demo_sequence,
-    apply_brightness_contrast,   
-    apply_gaussian_noise,        
+    apply_brightness_contrast,
+    apply_gaussian_noise,
     apply_spatial_jitter,
 )
 from .rl_loss import reinforce_with_baseline, mean_kl_logits, ess_ratio_from_rhos
@@ -65,9 +65,7 @@ def _collect_explore(
     device,
     max_steps: int = 250,
 ) -> ExploreRollout:
-    """Run phase-1 on-policy in the env and return tensors for RL training.
-       Uses the fixed (start, goal) from the task config. Pre-allocates on GPU,
-       then moves results back to CPU for caching."""
+    """Run phase-1 on-policy in the env and return tensors for RL training."""
     env.unwrapped.set_task(task_cfg)
 
     obs, _ = env.reset()
@@ -89,7 +87,6 @@ def _collect_explore(
 
     with torch.inference_mode():
         while not done and not trunc and steps < max_steps:
-            # build obs6 on GPU
             img = torch.from_numpy(obs.transpose(2, 0, 1)).to(device=device, dtype=torch.float32) / 255.0
             pa = torch.full((1, H, W), last_a, device=device, dtype=torch.float32)
             pr = torch.full((1, H, W), last_r, device=device, dtype=torch.float32)
@@ -97,7 +94,6 @@ def _collect_explore(
             obs6_t = torch.cat([img, pa, pr, bb], dim=0)
             states_buf[steps] = obs6_t
 
-            # policy step on the prefix [:steps+1]
             seq = states_buf[: steps + 1].unsqueeze(0)  # (1, t, 6,H,W)
             logits, _ = policy_net.act_single_step(seq)
             logits_t = logits[0] if logits.dim() == 2 else logits
@@ -227,14 +223,11 @@ def _maybe_augment_demo_six_cpu(p2_six_cpu: torch.Tensor, args) -> torch.Tensor:
     p2_six_cpu: (T,6,H,W) on CPU, float in [0,1] for RGB channels.
     Only augment channels [0:3] (RGB). Action/reward/boundary left untouched.
     """
-    # Gate: allow switching off from CLI without touching code
     if not bool(getattr(args, "use_aug", True)):
         return p2_six_cpu
-    # Per-sequence coin flip
     if np.random.rand() > float(getattr(args, "aug_prob", 0.5)):
         return p2_six_cpu
 
-    # Defaults (mild!)
     b_rng = getattr(args, "aug_brightness_range", (0.9, 1.1))
     c_rng = getattr(args, "aug_contrast_range",   (0.9, 1.1))
     noise_std   = float(getattr(args, "aug_noise_std", 0.02))
@@ -243,11 +236,9 @@ def _maybe_augment_demo_six_cpu(p2_six_cpu: torch.Tensor, args) -> torch.Tensor:
     p_noise     = float(getattr(args, "aug_noise_prob", 0.25))
     p_jitter    = float(getattr(args, "aug_jitter_prob", 0.25))
 
-    # Work in numpy to reuse your functions
-    x = p2_six_cpu.numpy()                 # (T,6,H,W)
-    imgs = x[:, 0:3, :, :]                 # view to RGB
+    x = p2_six_cpu.numpy()   # (T,6,H,W)
+    imgs = x[:, 0:3, :, :]
 
-    # Apply at most a few light transforms (independent coins)
     if np.random.rand() < p_bc:
         imgs = apply_brightness_contrast(imgs, brightness_range=b_rng, contrast_range=c_rng)
     if np.random.rand() < p_noise:
@@ -256,9 +247,7 @@ def _maybe_augment_demo_six_cpu(p2_six_cpu: torch.Tensor, args) -> torch.Tensor:
         imgs = apply_spatial_jitter(imgs, max_shift=jitter_max)
 
     x[:, 0:3, :, :] = imgs
-    # return a fresh tensor (still CPU)
     return torch.from_numpy(x).float()
-
 
 def run_training():
     args = parse_args()
@@ -266,9 +255,8 @@ def run_training():
     start_time = datetime.datetime.utcnow()
 
     # —— New knobs (safe defaults if not present in config) ——
-    nbc = int(getattr(args, "nbc", 8))  # number of BC (outer) steps per collected explore
-    bc_only_after_first = bool(getattr(args, "bc_only_after_first", False))  # do RL only on k==0
-    # If you prefer to recompute RL each outer step (closer to MRI), set this True
+    nbc = int(getattr(args, "nbc", 8))  # number of outer updates per collected explore
+    bc_only_after_first = bool(getattr(args, "bc_only_after_first", False))
     recompute_rl_each_outer = bool(getattr(args, "recompute_rl_each_outer", True))
 
     # Seeding
@@ -307,9 +295,7 @@ def run_training():
         else:
             continue
 
-        # Ensure the (start, goal) in the trial match the manifest for this task
         _assert_start_goal_match(recs, tdict, tid)
-
         p2_paths = _first_demo_paths(recs, args.demo_root)
         if len(p2_paths) == 0:
             continue
@@ -392,7 +378,6 @@ def run_training():
     improved = False
     final_epoch = start_epoch
 
-    # Per-epoch explore cache (CPU; discarded at epoch end)
     free_every = 8  # call empty_cache every N updates (CUDA only)
     updates_since_free = 0
 
@@ -413,7 +398,10 @@ def run_training():
             )
             logger.info("[ENCODER] Warmup complete; switched to two param groups.")
 
-        explore_cache: Dict[int, ExploreRollout] = {}
+        # ---------- epoch-local caches ----------
+        explore_cache: Dict[int, ExploreRollout] = {}  # CPU rollouts
+        # Per-batch tensors keyed by tid; cleared every minibatch
+        per_task_tensors: Dict[int, Dict[str, torch.Tensor]] = {}
 
         num_batches = math.ceil(len(train_tasks) / max(1, args.batch_size))
         batch_indices = list(range(len(train_tasks)))
@@ -433,12 +421,17 @@ def run_training():
             batch_ids = [batch_indices[i] for i in range(start, end)]
             batch_tasks = [train_tasks[i] for i in batch_ids]
 
+            # --------- PREPARE each task in the minibatch (build tensors once) ---------
+            per_task_tensors.clear()
+            tasks_used: List[int] = []
+
             for task in batch_tasks:
                 tid = task["task_id"]
                 cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
 
                 # Ensure we have a fresh or valid explore rollout (cache lives on CPU)
-                if tid not in explore_cache or explore_cache[tid].reuse_count >= args.explore_reuse_M:
+                need_new = (tid not in explore_cache) or (explore_cache[tid].reuse_count >= args.explore_reuse_M)
+                if need_new:
                     rollout = _collect_explore(policy_net, train_env, cfg, device, max_steps=250)
                     explore_cache[tid] = rollout
                 else:
@@ -450,7 +443,6 @@ def run_training():
                         if mean_kl_logits(cur_logits_tmp, explore_cache[tid].beh_logits.to(device)).item() > args.kl_refresh_threshold:
                             rollout = _collect_explore(policy_net, train_env, cfg, device, max_steps=250)
                             explore_cache[tid] = rollout
-                    # free temp GPU copy
                     try:
                         del seq_dev_tmp, logits_all_tmp, cur_logits_tmp
                     except NameError:
@@ -458,14 +450,14 @@ def run_training():
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
 
-                # -------- Copy explore chunk to device --------
-                exp_six_dev  = explore_cache[tid].obs6.to(device, non_blocking=True)      # (Tx,6,H,W)
-                actions_x    = explore_cache[tid].actions.to(device, non_blocking=True)   # (Tx,)
-                rewards_x    = explore_cache[tid].rewards.to(device, non_blocking=True)   # (Tx,)
-                beh_logits_x = explore_cache[tid].beh_logits.to(device, non_blocking=True)# (Tx,A)
+                # Copy explore chunk to device
+                exp_six_dev  = explore_cache[tid].obs6.to(device, non_blocking=True)       # (Tx,6,H,W)
+                actions_x    = explore_cache[tid].actions.to(device, non_blocking=True)    # (Tx,)
+                rewards_x    = explore_cache[tid].rewards.to(device, non_blocking=True)    # (Tx,)
+                beh_logits_x = explore_cache[tid].beh_logits.to(device, non_blocking=True) # (Tx,A)
                 Tx = exp_six_dev.shape[0]
 
-                # -------- Precompute RL once (k=0), optional recompute later --------
+                # RL precompute at k==0 baseline
                 with autocast(device_type="cuda", enabled=use_amp):
                     logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
                     cur_logits_x0 = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
@@ -477,7 +469,7 @@ def run_training():
                     else:
                         values_x0 = values_x0.squeeze()
 
-                    loss_rl_0, ent_x_0, adv_abs_0 = reinforce_with_baseline(
+                    loss_rl_0, ent_x_0, _ = reinforce_with_baseline(
                         cur_logits=cur_logits_x0,
                         actions=actions_x,
                         rewards=rewards_x,
@@ -491,18 +483,16 @@ def run_training():
                         is_clip_rho=args.is_clip_rho,
                     )
 
-                # -------- Build batched BC tensors from ALL demos (once) --------
+                # Build BC tensors for ALL demos (once per task)
                 prev_action_start = float(actions_x[-1].item()) if Tx > 0 else 0.0
-
                 demo_obs_list: List[torch.Tensor] = []
                 demo_lab_list: List[torch.Tensor] = []
 
-                # Build on GPU, then reused for all nbc steps
                 for demo_path in task["p2_paths"]:
                     p2_six, p2_labels = _load_phase2_six_and_labels(demo_path, prev_action_start=prev_action_start)
                     if p2_six.numel() == 0:
                         continue
-                    p2_six = _maybe_augment_demo_six_cpu(p2_six, args) # augmentation
+                    p2_six = _maybe_augment_demo_six_cpu(p2_six, args)
                     p2_six = p2_six.to(device, non_blocking=True)
                     p2_labels = p2_labels.to(device, non_blocking=True)
                     obs6_cat, labels_cat, _, _ = _concat_explore_and_exploit(exp_six_dev, p2_six, p2_labels)
@@ -510,7 +500,8 @@ def run_training():
                     demo_lab_list.append(labels_cat)
 
                 if len(demo_obs_list) == 0:
-                    # free explore dev copies before continue
+                    # Nothing to supervise for this task — skip it this batch
+                    # Free heavy tensors from this task before continuing
                     del exp_six_dev, actions_x, rewards_x, beh_logits_x
                     try:
                         del logits_x_all, values_x_all, cur_logits_x0, values_x0
@@ -520,12 +511,9 @@ def run_training():
                         torch.cuda.empty_cache()
                     continue
 
-                B_d = len(demo_obs_list)
                 T_max = max(x.shape[0] for x in demo_obs_list)
                 H, W = demo_obs_list[0].shape[-2], demo_obs_list[0].shape[-1]
-
-                pad_obs = []
-                pad_lab = []
+                pad_obs, pad_lab = [], []
                 for x, y in zip(demo_obs_list, demo_lab_list):
                     t = x.shape[0]
                     if t < T_max:
@@ -537,48 +525,123 @@ def run_training():
                 batch_obs = torch.stack(pad_obs, dim=0)  # (B_d, T_max, 6,H,W)
                 batch_lab = torch.stack(pad_lab, dim=0)  # (B_d, T_max)
 
-                # ---- MULTIPLE OUTER (BC) STEPS reusing the SAME explore ----
-                for k in range(nbc):
-                    optimizer.zero_grad(set_to_none=True)
+                # Stash everything we need per task for the k-loop
+                per_task_tensors[tid] = {
+                    "batch_obs": batch_obs,
+                    "batch_lab": batch_lab,
+                    "loss_rl0": loss_rl_0,             # graph-bearing if recompute=False and k==0
+                    "ent0": torch.as_tensor(ent_x_0).detach(),
+                }
+                if recompute_rl_each_outer:
+                    per_task_tensors[tid].update({
+                        "exp": exp_six_dev,
+                        "actions": actions_x,
+                        "rewards": rewards_x,
+                        "beh_logits": beh_logits_x,
+                    })
+                else:
+                    # Free big explore tensors if we won't recompute RL each k
+                    del exp_six_dev, actions_x, rewards_x, beh_logits_x
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
-                    with autocast(device_type="cuda", enabled=use_amp):
-                        # Decide RL contribution this step
-                        if k == 0 and bc_only_after_first:
-                            loss_rl_k, ent_x_k = loss_rl_0, ent_x_0
-                        elif not bc_only_after_first and not recompute_rl_each_outer:
-                            # reuse the k=0 RL each step
-                            loss_rl_k, ent_x_k = loss_rl_0, ent_x_0
-                        elif recompute_rl_each_outer:
-                            # recompute RL against SAME explore each outer step (closer to MRI)
-                            logits_x_all_k, values_x_all_k = policy_net(exp_six_dev.unsqueeze(0))
-                            cur_logits_x_k = logits_x_all_k[0] if logits_x_all_k.dim() == 3 else logits_x_all_k
-                            values_x_k = values_x_all_k
-                            if values_x_k.dim() == 3:
-                                values_x_k = values_x_k[0, :, 0]
-                            elif values_x_k.dim() == 2:
-                                values_x_k = values_x_k[0]
+                tasks_used.append(tid)
+
+            # --------- OUTER LOOP: MRI-style (one step per k over the batch) ---------
+            if len(tasks_used) == 0:
+                # No supervised data in this minibatch; skip optimizer work
+                continue
+
+            for k in range(nbc):
+                optimizer.zero_grad(set_to_none=True)
+                total_loss = 0.0
+                total_bc = 0.0
+                total_rl = 0.0
+                total_ent = 0.0
+                denom = 0
+
+                for tid in tasks_used:
+                    tensors = per_task_tensors[tid]
+                    batch_obs = tensors["batch_obs"]
+                    batch_lab = tensors["batch_lab"]
+
+                    # --- RL term selection ---
+                    if bc_only_after_first:
+                        if k == 0:
+                            if recompute_rl_each_outer:
+                                with autocast(device_type="cuda", enabled=use_amp):
+                                    exp = per_task_tensors[tid]["exp"]
+                                    actions = per_task_tensors[tid]["actions"]
+                                    rewards = per_task_tensors[tid]["rewards"]
+                                    beh_logits = per_task_tensors[tid]["beh_logits"]
+                                    logits_x_all_k, values_x_all_k = policy_net(exp.unsqueeze(0))
+                                    cur_logits_x_k = logits_x_all_k[0] if logits_x_all_k.dim() == 3 else logits_x_all_k
+                                    values_x_k = values_x_all_k
+                                    if values_x_k.dim() == 3:
+                                        values_x_k = values_x_k[0, :, 0]
+                                    elif values_x_k.dim() == 2:
+                                        values_x_k = values_x_k[0]
+                                    else:
+                                        values_x_k = values_x_k.squeeze()
+                                    loss_rl_k, ent_x_k, _ = reinforce_with_baseline(
+                                        cur_logits=cur_logits_x_k,
+                                        actions=actions,
+                                        rewards=rewards,
+                                        values=values_x_k,
+                                        gamma=args.gamma,
+                                        lam=args.gae_lambda,
+                                        use_gae=args.use_gae,
+                                        entropy_coef=args.explore_entropy_coef,
+                                        behavior_logits=beh_logits if args.offpolicy_correction != "none" else None,
+                                        offpolicy=args.offpolicy_correction,
+                                        is_clip_rho=args.is_clip_rho,
+                                    )
                             else:
-                                values_x_k = values_x_k.squeeze()
-
-                            loss_rl_k, ent_x_k, _ = reinforce_with_baseline(
-                                cur_logits=cur_logits_x_k,
-                                actions=actions_x,
-                                rewards=rewards_x,
-                                values=values_x_k,
-                                gamma=args.gamma,
-                                lam=args.gae_lambda,
-                                use_gae=args.use_gae,
-                                entropy_coef=args.explore_entropy_coef,
-                                behavior_logits=beh_logits_x if args.offpolicy_correction != "none" else None,
-                                offpolicy=args.offpolicy_correction,
-                                is_clip_rho=args.is_clip_rho,
-                            )
+                                # use k=0 RL once; detach to avoid graph reuse issues
+                                loss_rl_k = tensors["loss_rl0"].detach()
+                                ent_x_k = float(tensors["ent0"])
                         else:
-                            # BC-only step (k>0)
                             loss_rl_k = torch.tensor(0.0, device=device, dtype=torch.float32)
                             ent_x_k = 0.0
+                    else:
+                        if recompute_rl_each_outer:
+                            with autocast(device_type="cuda", enabled=use_amp):
+                                exp = per_task_tensors[tid]["exp"]
+                                actions = per_task_tensors[tid]["actions"]
+                                rewards = per_task_tensors[tid]["rewards"]
+                                beh_logits = per_task_tensors[tid]["beh_logits"]
+                                logits_x_all_k, values_x_all_k = policy_net(exp.unsqueeze(0))
+                                cur_logits_x_k = logits_x_all_k[0] if logits_x_all_k.dim() == 3 else logits_x_all_k
+                                values_x_k = values_x_all_k
+                                if values_x_k.dim() == 3:
+                                    values_x_k = values_x_k[0, :, 0]
+                                elif values_x_k.dim() == 2:
+                                    values_x_k = values_x_k[0]
+                                else:
+                                    values_x_k = values_x_k.squeeze()
+                                loss_rl_k, ent_x_k, _ = reinforce_with_baseline(
+                                    cur_logits=cur_logits_x_k,
+                                    actions=actions,
+                                    rewards=rewards,
+                                    values=values_x_k,
+                                    gamma=args.gamma,
+                                    lam=args.gae_lambda,
+                                    use_gae=args.use_gae,
+                                    entropy_coef=args.explore_entropy_coef,
+                                    behavior_logits=beh_logits if args.offpolicy_correction != "none" else None,
+                                    offpolicy=args.offpolicy_correction,
+                                    is_clip_rho=args.is_clip_rho,
+                                )
+                        else:
+                            # reuse the precomputed value but DETACH so we don't backprop same graph multiple times
+                            if k == 0:
+                                loss_rl_k = tensors["loss_rl0"]
+                            else:
+                                loss_rl_k = tensors["loss_rl0"].detach()
+                            ent_x_k = float(tensors["ent0"])
 
-                        # BC on demos (reuse same batch each outer step)
+                    # --- BC term ---
+                    with autocast(device_type="cuda", enabled=use_amp):
                         logits_b, _ = policy_net(batch_obs)  # (B_d, T_max, A)
                         if args.label_smoothing > 0.0:
                             loss_bc_k = smoothed_cross_entropy(
@@ -589,36 +652,48 @@ def run_training():
                             ce = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
                             loss_bc_k = ce(logits_b.reshape(-1, logits_b.size(-1)), batch_lab.reshape(-1))
 
-                        loss_k = args.rl_coef * loss_rl_k + loss_bc_k
+                        loss_task = args.rl_coef * loss_rl_k + loss_bc_k
 
-                    scaler.scale(loss_k).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    total_loss = loss_task if denom == 0 else (total_loss + loss_task)
+                    total_bc += float(loss_bc_k.detach().cpu())
+                    total_rl += float(loss_rl_k.detach().cpu()) if isinstance(loss_rl_k, torch.Tensor) else float(loss_rl_k)
+                    total_ent += float(ent_x_k)
+                    denom += 1
 
-                    # update logs
-                    running_train_loss += float(loss_k.detach().cpu())
-                    running_bc         += float(loss_bc_k.detach().cpu())
-                    running_rl         += float(loss_rl_k.detach().cpu())
-                    running_ent        += float(ent_x_k)
-                    count_updates      += 1
-                    updates_since_free += 1
+                if denom == 0:
+                    continue
 
-                    # count reuse of explore (so refresh gates work)
+                avg_loss = total_loss / float(denom)
+
+                scaler.scale(avg_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+
+                running_train_loss += float(avg_loss.detach().cpu())
+                running_bc         += (total_bc / denom)
+                running_rl         += (total_rl / denom)
+                running_ent        += (total_ent / denom)
+                count_updates      += 1
+                updates_since_free += 1
+
+                # mark reuse for explore refresh gating
+                for tid in tasks_used:
                     explore_cache[tid].reuse_count += 1
 
-                    if device.type == "cuda" and updates_since_free >= free_every:
-                        torch.cuda.empty_cache()
-                        updates_since_free = 0
-
-                # ---- free big tensors ASAP ----
-                del (exp_six_dev, actions_x, rewards_x, beh_logits_x,
-                     logits_x_all, values_x_all, cur_logits_x0, values_x0,
-                     demo_obs_list, demo_lab_list, pad_obs, pad_lab,
-                     batch_obs, batch_lab, logits_b, loss_bc_k, loss_k)
-                if device.type == "cuda":
+                if device.type == "cuda" and updates_since_free >= free_every:
                     torch.cuda.empty_cache()
+                    updates_since_free = 0
+
+            # --------- free per-batch tensors ----------
+            for tid in tasks_used:
+                t = per_task_tensors[tid]
+                for key in list(t.keys()):
+                    t[key] = None
+            per_task_tensors.clear()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
             if count_updates > 0:
                 pbar.set_postfix(loss=f"{running_train_loss/max(1,count_updates):.3f}",
@@ -646,7 +721,6 @@ def run_training():
             patience, improved, improved_this = 0, True, True
             save_checkpoint(policy_net, epoch, best_val_score, args.save_path, args.load_path)
         else:
-            # early stop bookkeeping only
             patience += (0 if getattr(args, "disable_early_stop", False) else 1)
 
         if getattr(args, "disable_early_stop", False) and not improved_this:
