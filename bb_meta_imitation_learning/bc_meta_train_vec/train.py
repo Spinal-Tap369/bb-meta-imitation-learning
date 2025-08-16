@@ -17,7 +17,7 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from tqdm.auto import tqdm
 import gymnasium as gym
-from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
+from gymnasium.vector import AsyncVectorEnv
 
 from bb_meta_imitation_learning.env.maze_task import MazeTaskManager
 
@@ -80,7 +80,6 @@ def _make_base_env():
 def _make_env_fn_with_task(task_cfg: MazeTaskManager.TaskConfig):
     """Thunk that builds a shaping-wrapped env and sets the task before first reset."""
     def _thunk():
-        import os
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
         os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp")
@@ -657,6 +656,7 @@ def run_training():
                 cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
 
                 # KL-based refresh against current policy if cache exists
+                did_refresh_kl = False
                 if tid in explore_cache:
                     with torch.no_grad():
                         seq_dev_tmp = explore_cache[tid].obs6.to(device, non_blocking=True).unsqueeze(0)
@@ -666,6 +666,7 @@ def run_training():
                             # recollect just this one (vec size = 1)
                             ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250, seed_base=args.seed + 999999).pop()
                             explore_cache[tid] = ro
+                            did_refresh_kl = True
                     try:
                         del seq_dev_tmp, logits_all_tmp, cur_logits_tmp
                     except NameError:
@@ -676,6 +677,13 @@ def run_training():
                     # if somehow still missing, collect once
                     ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250, seed_base=args.seed + 424242).pop()
                     explore_cache[tid] = ro
+
+                # If KL refresh changed the rollout, drop any stale precompute for this tid
+                if did_refresh_kl:
+                    if tid in precomp_logits_by_tid:
+                        del precomp_logits_by_tid[tid]
+                    if tid in precomp_values_by_tid:
+                        del precomp_values_by_tid[tid]
 
                 # -------- Copy explore chunk to device --------
                 exp_six_dev  = explore_cache[tid].obs6.to(device, non_blocking=True)      # (Tx,6,H,W)
@@ -692,10 +700,14 @@ def run_training():
 
                 # -------- Precompute RL once (k=0), optional recompute later --------
                 with autocast(device_type="cuda", enabled=use_amp):
-                    if tid in precomp_logits_by_tid and tid in precomp_values_by_tid:
-                        cur_logits_x0 = precomp_logits_by_tid[tid]   # (Tx, A)
-                        values_x0     = precomp_values_by_tid[tid]   # (Tx,)
-                    else:
+                    use_precomp = False
+                    if (tid in precomp_logits_by_tid) and (tid in precomp_values_by_tid):
+                        cur_logits_x0 = precomp_logits_by_tid[tid]
+                        values_x0     = precomp_values_by_tid[tid]
+                        # Shape guard: only use if lengths match current Tx
+                        if cur_logits_x0.size(0) == Tx and values_x0.size(0) == Tx:
+                            use_precomp = True
+                    if not use_precomp:
                         logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
                         cur_logits_x0 = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
                         values_x0 = values_x_all
@@ -705,6 +717,9 @@ def run_training():
                             values_x0 = values_x0[0]
                         else:
                             values_x0 = values_x0.squeeze()
+                        # Normalize shapes
+                        cur_logits_x0 = cur_logits_x0[-Tx:, :]  # (Tx, A)
+                        values_x0 = values_x0.view(-1)[-Tx:]    # (Tx,)
 
                     loss_rl_0, ent_x_0, _ = reinforce_with_baseline(
                         cur_logits=cur_logits_x0,
@@ -744,6 +759,9 @@ def run_training():
                             values_x0 = values_x0[0]
                         else:
                             values_x0 = values_x0.squeeze()
+                        # Normalize shapes after refresh
+                        cur_logits_x0 = cur_logits_x0[-Tx:, :]
+                        values_x0 = values_x0.view(-1)[-Tx:]
 
                 # -------- Build batched BC tensors from ALL demos (once) --------
                 prev_action_start = float(actions_x[-1].item()) if Tx > 0 else 0.0
