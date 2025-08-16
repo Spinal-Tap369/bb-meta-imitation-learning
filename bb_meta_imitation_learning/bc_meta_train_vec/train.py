@@ -103,10 +103,12 @@ def _collect_explore_vec(
     """
     Collect phase-1 rollouts for a list of tasks using an AsyncVectorEnv.
     Returns a list of ExploreRollout in the same order as task_cfgs.
-    Adds sanity/timing logs so you can confirm vectorization actually happened.
+    Vectorizes BOTH env stepping and policy forward:
+      - builds a (B_alive, T_max, 6, H, W) padded batch each tick
+      - calls policy_net(...) once per tick, not per env
+    Also logs batching sanity metrics.
     """
-    import time as _time  # local import to avoid cluttering globals
-
+    import time as _time
     n = len(task_cfgs)
     if n == 0:
         return []
@@ -116,16 +118,15 @@ def _collect_explore_vec(
         shared_memory=False
     )
 
-    # ---- SANITY: confirm what we actually built ----
+    # Sanity: confirm vector env type
     try:
         is_async = isinstance(vec_env, gym.vector.AsyncVectorEnv)
     except Exception:
-        # very defensive: fall back to name check
         is_async = "AsyncVectorEnv" in type(vec_env).__name__
     num_envs = getattr(vec_env, "num_envs", n)
     logger.info(f"[VEC] created {type(vec_env).__name__} (async={bool(is_async)}) num_envs={num_envs}")
 
-    # Seed deterministically if provided
+    # Seed per env if provided
     seeds = None
     if seed_base is not None:
         seeds = [int(seed_base + i) for i in range(n)]
@@ -133,26 +134,27 @@ def _collect_explore_vec(
     t0_total = _time.time()
     t_env = 0.0
     t_net = 0.0
-    n_env_steps_total = 0
+    fwd_calls_total = 0
+    fwd_calls_batched = 0
+    fwd_batch_size_accum = 0
 
     try:
-        # reset (some gym versions return (obs, info), some just obs)
+        # reset (gym API differences)
         try:
             obs_batch, _ = vec_env.reset(seed=seeds)
         except TypeError:
             obs_batch = vec_env.reset(seed=seeds)
 
-        # infer per-frame spatial shape from the first env’s observation
+        # infer spatial dims
         obs0 = obs_batch[0]
         if obs0.ndim == 3 and obs0.shape[-1] == 3:      # (H, W, 3)
             H, W = int(obs0.shape[0]), int(obs0.shape[1])
         elif obs0.ndim == 3 and obs0.shape[0] == 3:     # (3, H, W)
             H, W = int(obs0.shape[1]), int(obs0.shape[2])
-        else:
-            # best-effort fallback: assume HxWx3
+        else:                                           # fallback
             H, W = int(obs0.shape[0]), int(obs0.shape[1])
 
-        # per-env buffers on GPU (fast); moved to CPU before returning
+        # per-env buffers (GPU for speed; moved to CPU when returning)
         states_buf = [torch.empty((max_steps, 6, H, W), device=device, dtype=torch.float32) for _ in range(n)]
         beh_logits_buf: List[List[torch.Tensor]] = [[] for _ in range(n)]
         actions_list: List[List[int]] = [[] for _ in range(n)]
@@ -161,29 +163,22 @@ def _collect_explore_vec(
         alive = [True for _ in range(n)]
         last_a = [0.0 for _ in range(n)]
         last_r = [0.0 for _ in range(n)]
+        last_obs = list(obs_batch)
         n_alive = n
 
-        # keep most recent observations (as a Python list)
-        last_obs = list(obs_batch)
-
-        # roll until all done or max_steps reached for all
         while n_alive > 0:
-            actions = np.zeros((n,), dtype=np.int64)
-
-            # --- network forward for alive envs ---
-            t_net_start = _time.time()
+            # Build obs6 for all alive envs and write this step into their buffers
+            alive_indices = []
             for i in range(n):
                 if not alive[i]:
                     continue
-
-                # build obs6 on GPU
                 obsi = last_obs[i]
                 if obsi.ndim == 3 and obsi.shape[-1] == 3:      # (H, W, 3)
                     img_np = obsi.transpose(2, 0, 1)
                 elif obsi.ndim == 3 and obsi.shape[0] == 3:     # (3, H, W)
                     img_np = obsi
                 else:
-                    img_np = obsi.transpose(2, 0, 1)            # assume HxWx3
+                    img_np = obsi.transpose(2, 0, 1)
 
                 img = torch.from_numpy(img_np).to(device=device, dtype=torch.float32) / 255.0
                 pa = torch.full((1, H, W), last_a[i], device=device, dtype=torch.float32)
@@ -191,27 +186,52 @@ def _collect_explore_vec(
                 bb = torch.zeros((1, H, W), device=device, dtype=torch.float32)  # explore -> 0
                 obs6_t = torch.cat([img, pa, pr, bb], dim=0)
                 states_buf[i][steps_i[i]] = obs6_t
+                alive_indices.append(i)
 
-                # policy step on the prefix [:steps_i[i]+1]
-                seq = states_buf[i][: steps_i[i] + 1].unsqueeze(0)  # (1, t, 6, H, W)
-                with torch.inference_mode():
-                    logits, _ = policy_net.act_single_step(seq)
-                    logits_t = logits[0] if logits.dim() == 2 else logits
-                beh_logits_buf[i].append(logits_t.detach().clone())
-                actions[i] = int(torch.distributions.Categorical(logits=logits_t).sample().item())
+            # ---- BATCHED POLICY FORWARD over alive envs ----
+            t_net_start = _time.time()
+
+            # Build a left-padded batch (B_alive, T_max, 6, H, W)
+            B_alive = len(alive_indices)
+            T_lens = [steps_i[i] + 1 for i in alive_indices]  # +1 because we just wrote the new step
+            T_max = max(T_lens)
+            batch_seq = torch.zeros((B_alive, T_max, 6, H, W), device=device, dtype=torch.float32)
+
+            for bi, i in enumerate(alive_indices):
+                t = T_lens[bi]
+                batch_seq[bi, -t:, :, :, :] = states_buf[i][:t]  # left-pad zeros
+
+            with torch.inference_mode():
+                logits_batch, _ = policy_net(batch_seq)  # (B_alive, T_max, A)
+                # last valid timestep per env is always index -1 after left-padding
+                logits_last = logits_batch[:, -1, :]     # (B_alive, A)
+
+            # sample actions for all alive envs at once
+            dist = torch.distributions.Categorical(logits=logits_last)
+            actions_alive = dist.sample().detach().cpu().numpy().astype(np.int64)  # (B_alive,)
+
+            # record behavior logits for each env at this step
+            for bi, i in enumerate(alive_indices):
+                beh_logits_buf[i].append(logits_last[bi].detach().cpu())
+
             t_net += (_time.time() - t_net_start)
+            fwd_calls_total += 1
+            fwd_batch_size_accum += B_alive
+            if B_alive >= 2:
+                fwd_calls_batched += 1
 
-            # --- vectorized env step (everyone gets an action; finished envs get a dummy) ---
+            # Build full action array for vector env step
+            actions = np.zeros((n,), dtype=np.int64)
+            for bi, i in enumerate(alive_indices):
+                actions[i] = actions_alive[bi]
+
+            # ---- Vectorized env step ----
             t_env_start = _time.time()
             obs_batch, rew_batch, term_batch, trunc_batch, info_batch = vec_env.step(actions)
             t_env += (_time.time() - t_env_start)
 
-            # --- bookkeeping per env ---
-            step_alive = 0
-            for i in range(n):
-                if not alive[i]:
-                    continue
-                step_alive += 1
+            # ---- Bookkeeping ----
+            for bi, i in enumerate(alive_indices):
                 rewards_list[i].append(float(rew_batch[i]))
                 actions_list[i].append(int(actions[i]))
                 last_a[i] = float(actions[i])
@@ -222,24 +242,30 @@ def _collect_explore_vec(
                 if steps_i[i] >= max_steps or bool(term_batch[i]) or bool(trunc_batch[i]):
                     alive[i] = False
                     n_alive -= 1
-            n_env_steps_total += step_alive
 
-            # guard: if everyone reached max_steps, break
+            # guard: all hit max
             if all(si >= max_steps for si in steps_i):
                 break
 
-        # ---- SANITY SUMMARY (timing/throughput) ----
+        # ---- Sanity / timing summary ----
         elapsed = _time.time() - t0_total
         total_steps = sum(steps_i)
+        avg_fwd_batch = (fwd_batch_size_accum / max(fwd_calls_total, 1))
         logger.info(
             "[VEC] explore collect: async=%s n_envs=%d total_env_steps=%d "
-            "elapsed=%.2fs (env_step=%.2fs, net=%.2fs) throughput=%.1f steps/s steps_per_env=%s",
-            str(bool(is_async)), n, total_steps, elapsed, t_env, t_net,
-            (total_steps / max(elapsed, 1e-6)),
-            str(steps_i),
+            "elapsed=%.2fs (env_step=%.2fs, net=%.2fs) throughput=%.1f steps/s steps_per_env=%s "
+            "| fwd_calls=%d batched_calls=%d (%.1f%%) avg_fwd_batch=%.2f",
+            str(bool(is_async)), n, total_steps,
+            elapsed, t_env, t_net,
+            (total_steps / max(elapsed, 1e-6)), str(steps_i),
+            fwd_calls_total, fwd_calls_batched, 100.0 * (fwd_calls_batched / max(fwd_calls_total, 1)),
+            avg_fwd_batch,
         )
+        if n > 1 and fwd_calls_batched == 0:
+            logger.warning("[VEC][SANITY] No batched policy forwards occurred (B_alive never >= 2). "
+                           "This indicates either immediate terminations or a batching bug.")
 
-        # package results back to CPU
+        # Package results back to CPU
         rollouts: List[ExploreRollout] = []
         for i in range(n):
             T_i = steps_i[i]
@@ -269,6 +295,7 @@ def _collect_explore_vec(
             vec_env.close()
         except Exception:
             pass
+
 
 
 # ---------- demo concat & mild augmentation ----------
