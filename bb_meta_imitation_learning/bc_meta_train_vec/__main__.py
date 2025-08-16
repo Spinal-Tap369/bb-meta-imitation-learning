@@ -1,4 +1,4 @@
-# bc_meta_train/__main__.py
+# bc_meta_train_vec/__main__.py
 
 from .train import run_training
 
