@@ -1,4 +1,4 @@
-# bc_meta_train/train.py
+# bc_meta_train_vec/train.py
 
 import os
 import sys
@@ -651,7 +651,6 @@ def run_training():
                 precomp_logits_by_tid = {}
                 precomp_values_by_tid = {}
 
-
             # ---- per-task optimization (unchanged) ----
             for task in batch_tasks:
                 tid = task["task_id"]
@@ -685,6 +684,12 @@ def run_training():
                 beh_logits_x = explore_cache[tid].beh_logits.to(device, non_blocking=True)# (Tx,A)
                 Tx = exp_six_dev.shape[0]
 
+                # ensure optional forward-result names exist (so cleanup never errors)
+                logits_x_all = None
+                values_x_all = None
+                cur_logits_x0 = None
+                values_x0 = None
+
                 # -------- Precompute RL once (k=0), optional recompute later --------
                 with autocast(device_type="cuda", enabled=use_amp):
                     if tid in precomp_logits_by_tid and tid in precomp_values_by_tid:
@@ -700,7 +705,6 @@ def run_training():
                             values_x0 = values_x0[0]
                         else:
                             values_x0 = values_x0.squeeze()
-
 
                     loss_rl_0, ent_x_0, _ = reinforce_with_baseline(
                         cur_logits=cur_logits_x0,
@@ -759,12 +763,15 @@ def run_training():
                     demo_lab_list.append(labels_cat)
 
                 if len(demo_obs_list) == 0:
-                    # free explore dev copies before continue
-                    del exp_six_dev, actions_x, rewards_x, beh_logits_x
-                    try:
-                        del logits_x_all, values_x_all, cur_logits_x0, values_x0
-                    except NameError:
-                        pass
+                    # free explore dev copies before continue (safe None assignments)
+                    exp_six_dev = None
+                    actions_x = None
+                    rewards_x = None
+                    beh_logits_x = None
+                    logits_x_all = None
+                    values_x_all = None
+                    cur_logits_x0 = None
+                    values_x0 = None
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                     continue
@@ -860,11 +867,24 @@ def run_training():
                         torch.cuda.empty_cache()
                         updates_since_free = 0
 
-                # ---- free big tensors ASAP ----
-                del (exp_six_dev, actions_x, rewards_x, beh_logits_x,
-                     logits_x_all, values_x_all, cur_logits_x0, values_x0,
-                     demo_obs_list, demo_lab_list, pad_obs, pad_lab,
-                     batch_obs, batch_lab, logits_b, loss_bc_k, loss_k)
+                # ---- free big tensors ASAP (safe None assignments) ----
+                exp_six_dev = None
+                actions_x = None
+                rewards_x = None
+                beh_logits_x = None
+                logits_x_all = None
+                values_x_all = None
+                cur_logits_x0 = None
+                values_x0 = None
+                demo_obs_list = None
+                demo_lab_list = None
+                pad_obs = None
+                pad_lab = None
+                batch_obs = None
+                batch_lab = None
+                logits_b = None
+                loss_bc_k = None
+                loss_k = None
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
