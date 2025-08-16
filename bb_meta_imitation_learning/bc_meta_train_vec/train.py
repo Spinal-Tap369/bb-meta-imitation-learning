@@ -396,6 +396,24 @@ def _maybe_augment_demo_six_cpu(p2_six_cpu: torch.Tensor, args) -> torch.Tensor:
     x[:, 0:3, :, :] = imgs
     return torch.from_numpy(x).float()
 
+def _pad_stack_time(tensors: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Left-pad a list of (T_i, C, H, W) into a single (B, T_max, C, H, W) tensor with zeros.
+    New timesteps are aligned to the right; padding fills the left.
+    """
+    assert len(tensors) > 0
+    device = tensors[0].device
+    dtype  = tensors[0].dtype
+    C, H, W = tensors[0].shape[1:]
+    T_max = max(t.shape[0] for t in tensors)
+    B = len(tensors)
+    out = torch.zeros((B, T_max, C, H, W), device=device, dtype=dtype)
+    for i, t in enumerate(tensors):
+        Ti = t.shape[0]
+        out[i, -Ti:, ...] = t
+    return out
+
+
 # ---------- training loop ----------
 def run_training():
     args = parse_args()
@@ -577,6 +595,62 @@ def run_training():
                 ro_list = _collect_explore_vec(policy_net, cfgs, device, max_steps=250, seed_base=args.seed + 100000 * epoch + 1000 * b + off)
                 for t, ro in zip(slice_tasks, ro_list):
                     explore_cache[t["task_id"]] = ro
+            
+            # =========================
+            # NEW: Batched RL precompute on exploration rollouts (k=0)
+            # =========================
+            exp_list_dev = []
+            tids_in_minibatch = []
+            for task in batch_tasks:
+                tid = task["task_id"]
+                if tid not in explore_cache:
+                    # extremely defensive: if missing for any reason, collect once
+                    cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
+                    ro = _collect_explore_vec(
+                        policy_net, [cfg], device, max_steps=250,
+                        seed_base=args.seed + 424242
+                    ).pop()
+                    explore_cache[tid] = ro
+                exp_list_dev.append(explore_cache[tid].obs6.to(device, non_blocking=True))
+                tids_in_minibatch.append(tid)
+
+            if len(exp_list_dev) > 0:
+                batch_exp = _pad_stack_time(exp_list_dev)  # (B, T_max, 6, H, W)
+                t0_bfwd = time.time()
+                with autocast(device_type="cuda", enabled=use_amp):
+                    logits_batch_all, values_batch_all = policy_net(batch_exp)  # (B, T_max, A), (B, T_max, *)
+                bfwd_elapsed = time.time() - t0_bfwd
+
+                precomp_logits_by_tid: Dict[int, torch.Tensor] = {}
+                precomp_values_by_tid: Dict[int, torch.Tensor] = {}
+
+                T_list = [x.shape[0] for x in exp_list_dev]
+                for i, tid in enumerate(tids_in_minibatch):
+                    Ti = T_list[i]
+                    # logits -> (T_i, A)
+                    logits_i = logits_batch_all[i, -Ti:, :]
+                    # values -> (T_i,)
+                    values_i = values_batch_all[i]
+                    if values_i.dim() == 3:
+                        values_i = values_i[-Ti:, 0]
+                    elif values_i.dim() == 2:
+                        values_i = values_i[-Ti:, ]
+                    else:
+                        values_i = values_i.view(-1)[-Ti:]
+                    precomp_logits_by_tid[tid] = logits_i
+                    precomp_values_by_tid[tid] = values_i
+
+                B = len(exp_list_dev)
+                T_max = max(T_list) if T_list else 0
+                T_avg = float(sum(T_list) / max(1, len(T_list)))
+                logger.info(
+                    "[BATCHFWD] RL precompute: B=%d T_max=%d T_avg=%.1f one_fwd=YES time=%.2fs",
+                    B, T_max, T_avg, bfwd_elapsed
+                )
+            else:
+                precomp_logits_by_tid = {}
+                precomp_values_by_tid = {}
+
 
             # ---- per-task optimization (unchanged) ----
             for task in batch_tasks:
@@ -613,15 +687,20 @@ def run_training():
 
                 # -------- Precompute RL once (k=0), optional recompute later --------
                 with autocast(device_type="cuda", enabled=use_amp):
-                    logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
-                    cur_logits_x0 = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
-                    values_x0 = values_x_all
-                    if values_x0.dim() == 3:
-                        values_x0 = values_x0[0, :, 0]
-                    elif values_x0.dim() == 2:
-                        values_x0 = values_x0[0]
+                    if tid in precomp_logits_by_tid and tid in precomp_values_by_tid:
+                        cur_logits_x0 = precomp_logits_by_tid[tid]   # (Tx, A)
+                        values_x0     = precomp_values_by_tid[tid]   # (Tx,)
                     else:
-                        values_x0 = values_x0.squeeze()
+                        logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
+                        cur_logits_x0 = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
+                        values_x0 = values_x_all
+                        if values_x0.dim() == 3:
+                            values_x0 = values_x0[0, :, 0]
+                        elif values_x0.dim() == 2:
+                            values_x0 = values_x0[0]
+                        else:
+                            values_x0 = values_x0.squeeze()
+
 
                     loss_rl_0, ent_x_0, _ = reinforce_with_baseline(
                         cur_logits=cur_logits_x0,
