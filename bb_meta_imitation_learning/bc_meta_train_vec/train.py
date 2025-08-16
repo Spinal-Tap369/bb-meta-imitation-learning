@@ -1,3 +1,5 @@
+# bc_meta_train/train.py
+
 import os
 import sys
 import json
@@ -7,6 +9,7 @@ import datetime
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+import time
 
 import numpy as np
 import torch
@@ -14,6 +17,7 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from tqdm.auto import tqdm
 import gymnasium as gym
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 
 from bb_meta_imitation_learning.env.maze_task import MazeTaskManager
 
@@ -76,11 +80,17 @@ def _make_base_env():
 def _make_env_fn_with_task(task_cfg: MazeTaskManager.TaskConfig):
     """Thunk that builds a shaping-wrapped env and sets the task before first reset."""
     def _thunk():
+        import os
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+        os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+        os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp")
+        os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
         env = _make_base_env()
         env.unwrapped.set_task(task_cfg)
         env = Phase1ShapingWrapper(env)  # shaping only affects phase-1
         return env
     return _thunk
+
 
 # ---------- vectorized explore collection ----------
 def _collect_explore_vec(
@@ -93,63 +103,87 @@ def _collect_explore_vec(
     """
     Collect phase-1 rollouts for a list of tasks using an AsyncVectorEnv.
     Returns a list of ExploreRollout in the same order as task_cfgs.
+    Adds sanity/timing logs so you can confirm vectorization actually happened.
     """
+    import time as _time  # local import to avoid cluttering globals
+
     n = len(task_cfgs)
     if n == 0:
         return []
 
-    vec_env = gym.vector.AsyncVectorEnv([_make_env_fn_with_task(cfg) for cfg in task_cfgs], shared_memory=False)
+    vec_env = gym.vector.AsyncVectorEnv(
+        [_make_env_fn_with_task(cfg) for cfg in task_cfgs],
+        shared_memory=False
+    )
+
+    # ---- SANITY: confirm what we actually built ----
+    try:
+        is_async = isinstance(vec_env, gym.vector.AsyncVectorEnv)
+    except Exception:
+        # very defensive: fall back to name check
+        is_async = "AsyncVectorEnv" in type(vec_env).__name__
+    num_envs = getattr(vec_env, "num_envs", n)
+    logger.info(f"[VEC] created {type(vec_env).__name__} (async={bool(is_async)}) num_envs={num_envs}")
 
     # Seed deterministically if provided
     seeds = None
     if seed_base is not None:
         seeds = [int(seed_base + i) for i in range(n)]
 
+    t0_total = _time.time()
+    t_env = 0.0
+    t_net = 0.0
+    n_env_steps_total = 0
+
     try:
+        # reset (some gym versions return (obs, info), some just obs)
         try:
             obs_batch, _ = vec_env.reset(seed=seeds)
         except TypeError:
-            # older gym versions may not return info from reset
             obs_batch = vec_env.reset(seed=seeds)
-            _ = None
 
-        # infer shape from first env
-        H, W = int(obs_batch[0].shape[0]), int(obs_batch[0].shape[1]) if obs_batch[0].ndim == 2 else (int(obs_batch[0].shape[0]), int(obs_batch[0].shape[1]))
-        if obs_batch[0].ndim == 3 and obs_batch[0].shape[-1] == 3:
-            H, W, _c = obs_batch[0].shape
+        # infer per-frame spatial shape from the first env’s observation
+        obs0 = obs_batch[0]
+        if obs0.ndim == 3 and obs0.shape[-1] == 3:      # (H, W, 3)
+            H, W = int(obs0.shape[0]), int(obs0.shape[1])
+        elif obs0.ndim == 3 and obs0.shape[0] == 3:     # (3, H, W)
+            H, W = int(obs0.shape[1]), int(obs0.shape[2])
+        else:
+            # best-effort fallback: assume HxWx3
+            H, W = int(obs0.shape[0]), int(obs0.shape[1])
 
-        # per-env buffers on GPU (fast); moved back to CPU before returning
+        # per-env buffers on GPU (fast); moved to CPU before returning
         states_buf = [torch.empty((max_steps, 6, H, W), device=device, dtype=torch.float32) for _ in range(n)]
-        beh_logits_buf = [[] for _ in range(n)]  # per-env list of (A,) tensors
-        actions_list = [[] for _ in range(n)]
-        rewards_list = [[] for _ in range(n)]
+        beh_logits_buf: List[List[torch.Tensor]] = [[] for _ in range(n)]
+        actions_list: List[List[int]] = [[] for _ in range(n)]
+        rewards_list: List[List[float]] = [[] for _ in range(n)]
         steps_i = [0 for _ in range(n)]
         alive = [True for _ in range(n)]
         last_a = [0.0 for _ in range(n)]
         last_r = [0.0 for _ in range(n)]
         n_alive = n
 
-        # keep most recent observations
+        # keep most recent observations (as a Python list)
         last_obs = list(obs_batch)
 
         # roll until all done or max_steps reached for all
         while n_alive > 0:
-            # build actions for all envs
             actions = np.zeros((n,), dtype=np.int64)
 
-            # (1) compute per-env logits/actions for those still alive
+            # --- network forward for alive envs ---
+            t_net_start = _time.time()
             for i in range(n):
                 if not alive[i]:
                     continue
 
-                # build obs6_t on GPU
-                if last_obs[i].ndim == 3 and last_obs[i].shape[-1] == 3:
-                    img_np = last_obs[i].transpose(2, 0, 1)
-                elif last_obs[i].ndim == 3 and last_obs[i].shape[0] == 3:
-                    img_np = last_obs[i]
+                # build obs6 on GPU
+                obsi = last_obs[i]
+                if obsi.ndim == 3 and obsi.shape[-1] == 3:      # (H, W, 3)
+                    img_np = obsi.transpose(2, 0, 1)
+                elif obsi.ndim == 3 and obsi.shape[0] == 3:     # (3, H, W)
+                    img_np = obsi
                 else:
-                    # fallback: assume HxWx3
-                    img_np = last_obs[i].transpose(2, 0, 1)
+                    img_np = obsi.transpose(2, 0, 1)            # assume HxWx3
 
                 img = torch.from_numpy(img_np).to(device=device, dtype=torch.float32) / 255.0
                 pa = torch.full((1, H, W), last_a[i], device=device, dtype=torch.float32)
@@ -159,21 +193,25 @@ def _collect_explore_vec(
                 states_buf[i][steps_i[i]] = obs6_t
 
                 # policy step on the prefix [:steps_i[i]+1]
-                seq = states_buf[i][: steps_i[i] + 1].unsqueeze(0)  # (1,t,6,H,W)
+                seq = states_buf[i][: steps_i[i] + 1].unsqueeze(0)  # (1, t, 6, H, W)
                 with torch.inference_mode():
                     logits, _ = policy_net.act_single_step(seq)
                     logits_t = logits[0] if logits.dim() == 2 else logits
                 beh_logits_buf[i].append(logits_t.detach().clone())
-                act_i = torch.distributions.Categorical(logits=logits_t).sample().item()
-                actions[i] = act_i
+                actions[i] = int(torch.distributions.Categorical(logits=logits_t).sample().item())
+            t_net += (_time.time() - t_net_start)
 
-            # (2) env step for everyone (finished envs receive a dummy action)
+            # --- vectorized env step (everyone gets an action; finished envs get a dummy) ---
+            t_env_start = _time.time()
             obs_batch, rew_batch, term_batch, trunc_batch, info_batch = vec_env.step(actions)
+            t_env += (_time.time() - t_env_start)
 
-            # (3) update per-env trackers
+            # --- bookkeeping per env ---
+            step_alive = 0
             for i in range(n):
                 if not alive[i]:
                     continue
+                step_alive += 1
                 rewards_list[i].append(float(rew_batch[i]))
                 actions_list[i].append(int(actions[i]))
                 last_a[i] = float(actions[i])
@@ -184,10 +222,22 @@ def _collect_explore_vec(
                 if steps_i[i] >= max_steps or bool(term_batch[i]) or bool(trunc_batch[i]):
                     alive[i] = False
                     n_alive -= 1
+            n_env_steps_total += step_alive
 
             # guard: if everyone reached max_steps, break
             if all(si >= max_steps for si in steps_i):
                 break
+
+        # ---- SANITY SUMMARY (timing/throughput) ----
+        elapsed = _time.time() - t0_total
+        total_steps = sum(steps_i)
+        logger.info(
+            "[VEC] explore collect: async=%s n_envs=%d total_env_steps=%d "
+            "elapsed=%.2fs (env_step=%.2fs, net=%.2fs) throughput=%.1f steps/s steps_per_env=%s",
+            str(bool(is_async)), n, total_steps, elapsed, t_env, t_net,
+            (total_steps / max(elapsed, 1e-6)),
+            str(steps_i),
+        )
 
         # package results back to CPU
         rollouts: List[ExploreRollout] = []
@@ -197,7 +247,15 @@ def _collect_explore_vec(
             actions = torch.tensor(actions_list[i], dtype=torch.long)
             rewards = torch.tensor(rewards_list[i], dtype=torch.float32)
             beh_logits = torch.stack(beh_logits_buf[i], dim=0).detach().cpu()
-            rollouts.append(ExploreRollout(obs6=obs6, actions=actions, rewards=rewards, beh_logits=beh_logits, reuse_count=0))
+            rollouts.append(
+                ExploreRollout(
+                    obs6=obs6,
+                    actions=actions,
+                    rewards=rewards,
+                    beh_logits=beh_logits,
+                    reuse_count=0,
+                )
+            )
 
         # explicit frees
         del states_buf, beh_logits_buf
@@ -211,6 +269,7 @@ def _collect_explore_vec(
             vec_env.close()
         except Exception:
             pass
+
 
 # ---------- demo concat & mild augmentation ----------
 def _concat_explore_and_exploit(
