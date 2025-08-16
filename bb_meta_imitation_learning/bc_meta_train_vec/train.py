@@ -123,7 +123,7 @@ def _collect_explore_vec(
     except Exception:
         is_async = "AsyncVectorEnv" in type(vec_env).__name__
     num_envs = getattr(vec_env, "num_envs", n)
-    logger.info(f"[VEC] created {type(vec_env).__name__} (async={bool(is_async)}) num_envs={num_envs}")
+    # logger.info(f"[VEC] created {type(vec_env).__name__} (async={bool(is_async)}) num_envs={num_envs}")
 
     # Seed per env if provided
     seeds = None
@@ -250,16 +250,16 @@ def _collect_explore_vec(
         elapsed = _time.time() - t0_total
         total_steps = sum(steps_i)
         avg_fwd_batch = (fwd_batch_size_accum / max(fwd_calls_total, 1))
-        logger.info(
-            "[VEC] explore collect: async=%s n_envs=%d total_env_steps=%d "
-            "elapsed=%.2fs (env_step=%.2fs, net=%.2fs) throughput=%.1f steps/s steps_per_env=%s "
-            "| fwd_calls=%d batched_calls=%d (%.1f%%) avg_fwd_batch=%.2f",
-            str(bool(is_async)), n, total_steps,
-            elapsed, t_env, t_net,
-            (total_steps / max(elapsed, 1e-6)), str(steps_i),
-            fwd_calls_total, fwd_calls_batched, 100.0 * (fwd_calls_batched / max(fwd_calls_total, 1)),
-            avg_fwd_batch,
-        )
+        # logger.info(
+        #     "[VEC] explore collect: async=%s n_envs=%d total_env_steps=%d "
+        #     "elapsed=%.2fs (env_step=%.2fs, net=%.2fs) throughput=%.1f steps/s steps_per_env=%s "
+        #     "| fwd_calls=%d batched_calls=%d (%.1f%%) avg_fwd_batch=%.2f",
+        #     str(bool(is_async)), n, total_steps,
+        #     elapsed, t_env, t_net,
+        #     (total_steps / max(elapsed, 1e-6)), str(steps_i),
+        #     fwd_calls_total, fwd_calls_batched, 100.0 * (fwd_calls_batched / max(fwd_calls_total, 1)),
+        #     avg_fwd_batch,
+        # )
         if n > 1 and fwd_calls_batched == 0:
             logger.warning("[VEC][SANITY] No batched policy forwards occurred (B_alive never >= 2). "
                            "This indicates either immediate terminations or a batching bug.")
@@ -642,10 +642,10 @@ def run_training():
                 Bsz = len(exp_list_dev)
                 T_max = max(T_list) if T_list else 0
                 T_avg = float(sum(T_list) / max(1, len(T_list)))
-                logger.info(
-                    "[BATCHFWD] RL precompute: B=%d T_max=%d T_avg=%.1f one_fwd=YES time=%.2fs",
-                    Bsz, T_max, T_avg, bfwd_elapsed
-                )
+                # logger.info(
+                #     "[BATCHFWD] RL precompute: B=%d T_max=%d T_avg=%.1f one_fwd=YES time=%.2fs",
+                #     Bsz, T_max, T_avg, bfwd_elapsed
+                # )
             else:
                 precomp_logits_by_tid = {}
                 precomp_values_by_tid = {}
@@ -1012,4 +1012,3 @@ def run_training():
 
 if __name__ == "__main__":
     run_training()
-
