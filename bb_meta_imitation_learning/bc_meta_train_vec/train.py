@@ -121,6 +121,11 @@ def _functional_forward(model: nn.Module, params: Dict[str, torch.Tensor], buffe
     mapping = _merge_params_and_buffers(params, buffers)
     return functional_call(model, mapping, (x,))
 
+def _split_trainable(params: Dict[str, torch.Tensor]):
+    trainable = {k: v for k, v in params.items() if v.requires_grad}
+    frozen    = {k: v for k, v in params.items() if not v.requires_grad}
+    return trainable, frozen
+
 
 # ---------- explore rollout cache ----------
 @dataclass
@@ -814,10 +819,23 @@ def run_training():
             for k in range(nbc):
                 ktimer = _timer() if debug_timing else None
                 params_theta_named, buffers_named = _named_params_and_buffers(policy_net)
+                # Split trainable vs frozen (handles encoder warmup safely)
+                trainable_named, frozen_named = _split_trainable(params_theta_named)
                 if head_only_inner:
-                    head_theta_named, rest_theta_named = _split_params_head_vs_rest(params_theta_named)
+                    head_theta_named, _ = _split_params_head_vs_rest(params_theta_named)
                 else:
-                    head_theta_named, rest_theta_named = params_theta_named, {}
+                    head_theta_named = trainable_named
+                
+                # Everything not updated in the inner step goes to "rest" (include frozen!)
+                rest_theta_named = {**frozen_named, **{k: v for k, v in params_theta_named.items() if k not in head_theta_named}}
+
+                # Debug logging
+                if bool(getattr(args, "debug", True)):
+                    logger.info(
+                        f"[INNER] k-loop={nbc} head_only={head_only_inner} "
+                        f"head_params={len(head_theta_named)} rest_params={len(rest_theta_named)} "
+                        f"trainable={len(trainable_named)} frozen={len(frozen_named)}"
+                    )
 
                 if is_verbose_batch and k == 0:
                     logger.info("[INNER] k-loop=%d head_only=%s head_params=%d rest_params=%d",
@@ -873,13 +891,19 @@ def run_training():
 
                     # (b) One differentiable inner step: θ -> φ on head params
                     grads = torch.autograd.grad(
-                        loss_in, tuple(head_theta_named.values()), create_graph=True, allow_unused=False
+                        loss_in, tuple(head_theta_named.values()), create_graph=True, allow_unused=True
                     )
                     if is_verbose_batch and idx_task == 0 and k == 0:
                         n_nan = sum((not _finite(g)) for g in grads if isinstance(g, torch.Tensor))
                         if n_nan > 0:
                             logger.warning("[GRAD][NONFINITE] inner grads contain %d non-finite entries", n_nan)
-                    phi_head = {kname: w - inner_lr * g for (kname, w), g in zip(head_theta_named.items(), grads)}
+                    phi_head = {}
+                    for (k, w), g in zip(head_theta_named.items(), grads):
+                        if g is None:
+                            if bool(getattr(args, "debug", True)):
+                                logger.warning(f"[INNER][GRAD] None grad for '{k}'; using zeros")
+                            g = torch.zeros_like(w)
+                        phi_head[k] = w - inner_lr * g
 
                     # (c) Evaluate BC at φ
                     with autocast(device_type="cuda", enabled=use_amp):
