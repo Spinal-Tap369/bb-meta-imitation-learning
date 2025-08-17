@@ -477,7 +477,7 @@ def run_training():
     head_only_inner = bool(getattr(args, "head_only_inner", False))
 
     # [DBG] logging flags (non-breaking)
-    debug = bool(getattr(args, "debug", True))
+    debug = bool(getattr(args, "debug", False))
     debug_level = str(getattr(args, "debug_level", "INFO")).upper()
     debug_every_batches = int(getattr(args, "debug_every_batches", 1))
     debug_tasks_per_batch = int(getattr(args, "debug_tasks_per_batch", 4))
