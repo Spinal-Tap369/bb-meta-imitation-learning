@@ -9,8 +9,8 @@ import datetime
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
-import time
 
+import time
 import numpy as np
 import torch
 from torch import nn
@@ -18,6 +18,15 @@ from torch.amp import GradScaler, autocast
 from tqdm.auto import tqdm
 import gymnasium as gym
 from gymnasium.vector import AsyncVectorEnv
+
+# --- functional call (PyTorch 2.0+) with fallback to functorch ---
+try:
+    from torch.func import functional_call
+except Exception:  # pragma: no cover
+    try:
+        from functorch import functional_call  # type: ignore
+    except Exception:
+        functional_call = None  # will raise later if actually used
 
 from bb_meta_imitation_learning.env.maze_task import MazeTaskManager
 
@@ -50,6 +59,69 @@ def _setup_logging():
     root.setLevel(logging.INFO)
     logging.getLogger(__name__).setLevel(logging.INFO)
 
+# [DBG] ---- debug helpers ----
+def _maybe_set_debug_level(debug: bool, level: str):
+    if not debug:
+        return
+    level = level.upper().strip()
+    lvl = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING}.get(level, logging.INFO)
+    logging.getLogger().setLevel(lvl)
+    logging.getLogger(__name__).setLevel(lvl)
+
+def _cuda_mem(prefix: str, device):
+    if device.type != "cuda":
+        return "CPU"
+    a = torch.cuda.memory_allocated() / (1024**2)
+    r = torch.cuda.memory_reserved() / (1024**2)
+    return f"{prefix} mem: alloc={a:.1f}MB reserved={r:.1f}MB"
+
+def _finite(t: torch.Tensor) -> bool:
+    return torch.isfinite(t.detach()).all().item() if isinstance(t, torch.Tensor) else True
+
+def _shape_str(t):
+    if isinstance(t, torch.Tensor):
+        return f"{tuple(t.shape)} {str(t.dtype).replace('torch.','')}"
+    return str(type(t))
+
+def _count_params(mod: nn.Module):
+    tot = sum(p.numel() for p in mod.parameters())
+    train = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+    return tot, train
+
+def _timer():
+    t0 = time.perf_counter()
+    return lambda: (time.perf_counter() - t0)
+
+# ---------- small functional utils for MRI-style inner step ----------
+def _named_params_and_buffers(net: nn.Module):
+    """Return separate dicts of named parameters and buffers."""
+    p = dict(net.named_parameters())
+    b = dict(net.named_buffers())
+    return p, b
+
+def _merge_params_and_buffers(params: Dict[str, torch.Tensor], buffers: Dict[str, torch.Tensor]):
+    """Functional call expects a single mapping of {name: tensor} for both."""
+    merged = {}
+    merged.update(buffers)  # buffers first so params override in unlikely name collision
+    merged.update(params)
+    return merged
+
+def _split_params_head_vs_rest(
+    params: Dict[str, torch.Tensor],
+    head_name_substr=("policy_head", "action_head", "logits")
+):
+    """Return (head_params, rest_params) by name substring match."""
+    head = {k: v for k, v in params.items() if any(s in k for s in head_name_substr)}
+    rest = {k: v for k, v in params.items() if k not in head}
+    return head, rest
+
+def _functional_forward(model: nn.Module, params: Dict[str, torch.Tensor], buffers: Dict[str, torch.Tensor], x: torch.Tensor):
+    if functional_call is None:
+        raise RuntimeError("functional_call is unavailable. Please use PyTorch >= 2.0 or install functorch.")
+    mapping = _merge_params_and_buffers(params, buffers)
+    return functional_call(model, mapping, (x,))
+
+
 # ---------- explore rollout cache ----------
 @dataclass
 class ExploreRollout:
@@ -59,6 +131,7 @@ class ExploreRollout:
     rewards: torch.Tensor        # (T,)       (CPU)
     beh_logits: torch.Tensor     # (T,A)      (CPU)
     reuse_count: int
+
 
 # ---------- env makers ----------
 def _make_base_env():
@@ -98,6 +171,8 @@ def _collect_explore_vec(
     device,
     max_steps: int = 250,
     seed_base: Optional[int] = None,
+    # [DBG] flags forwarded from outer scope for ad-hoc profiling/logging:
+    dbg=False, dbg_timing=True, dbg_level="INFO"
 ) -> List[ExploreRollout]:
     """
     Collect phase-1 rollouts for a list of tasks using an AsyncVectorEnv.
@@ -117,19 +192,16 @@ def _collect_explore_vec(
         shared_memory=False
     )
 
-    # Sanity: confirm vector env type
-    try:
-        is_async = isinstance(vec_env, gym.vector.AsyncVectorEnv)
-    except Exception:
-        is_async = "AsyncVectorEnv" in type(vec_env).__name__
-    num_envs = getattr(vec_env, "num_envs", n)
-    # logger.info(f"[VEC] created {type(vec_env).__name__} (async={bool(is_async)}) num_envs={num_envs}")
+    # [DBG] env sanity
+    if dbg:
+        try:
+            is_async = isinstance(vec_env, gym.vector.AsyncVectorEnv)
+        except Exception:
+            is_async = "AsyncVectorEnv" in type(vec_env).__name__
+        logger.log(logging.DEBUG if dbg_level=="DEBUG" else logging.INFO,
+                   f"[VEC] created {type(vec_env).__name__} async={bool(is_async)} num_envs={getattr(vec_env,'num_envs',n)}")
 
-    # Seed per env if provided
-    seeds = None
-    if seed_base is not None:
-        seeds = [int(seed_base + i) for i in range(n)]
-
+    # [DBG] timers
     t0_total = _time.time()
     t_env = 0.0
     t_net = 0.0
@@ -138,13 +210,11 @@ def _collect_explore_vec(
     fwd_batch_size_accum = 0
 
     try:
-        # reset (gym API differences)
         try:
-            obs_batch, _ = vec_env.reset(seed=seeds)
+            obs_batch, _ = vec_env.reset(seed=([int(seed_base + i) for i in range(n)] if seed_base is not None else None))
         except TypeError:
-            obs_batch = vec_env.reset(seed=seeds)
+            obs_batch = vec_env.reset(seed=([int(seed_base + i) for i in range(n)] if seed_base is not None else None))
 
-        # infer spatial dims
         obs0 = obs_batch[0]
         if obs0.ndim == 3 and obs0.shape[-1] == 3:      # (H, W, 3)
             H, W = int(obs0.shape[0]), int(obs0.shape[1])
@@ -153,7 +223,6 @@ def _collect_explore_vec(
         else:                                           # fallback
             H, W = int(obs0.shape[0]), int(obs0.shape[1])
 
-        # per-env buffers (GPU for speed; moved to CPU when returning)
         states_buf = [torch.empty((max_steps, 6, H, W), device=device, dtype=torch.float32) for _ in range(n)]
         beh_logits_buf: List[List[torch.Tensor]] = [[] for _ in range(n)]
         actions_list: List[List[int]] = [[] for _ in range(n)]
@@ -166,15 +235,14 @@ def _collect_explore_vec(
         n_alive = n
 
         while n_alive > 0:
-            # Build obs6 for all alive envs and write this step into their buffers
             alive_indices = []
             for i in range(n):
                 if not alive[i]:
                     continue
                 obsi = last_obs[i]
-                if obsi.ndim == 3 and obsi.shape[-1] == 3:      # (H, W, 3)
+                if obsi.ndim == 3 and obsi.shape[-1] == 3:
                     img_np = obsi.transpose(2, 0, 1)
-                elif obsi.ndim == 3 and obsi.shape[0] == 3:     # (3, H, W)
+                elif obsi.ndim == 3 and obsi.shape[0] == 3:
                     img_np = obsi
                 else:
                     img_np = obsi.transpose(2, 0, 1)
@@ -187,29 +255,23 @@ def _collect_explore_vec(
                 states_buf[i][steps_i[i]] = obs6_t
                 alive_indices.append(i)
 
-            # ---- BATCHED POLICY FORWARD over alive envs ----
+            # batched policy forward over alive envs
             t_net_start = _time.time()
-
-            # Build a left-padded batch (B_alive, T_max, 6, H, W)
             B_alive = len(alive_indices)
-            T_lens = [steps_i[i] + 1 for i in alive_indices]  # +1 because we just wrote the new step
+            T_lens = [steps_i[i] + 1 for i in alive_indices]
             T_max = max(T_lens)
             batch_seq = torch.zeros((B_alive, T_max, 6, H, W), device=device, dtype=torch.float32)
-
             for bi, i in enumerate(alive_indices):
                 t = T_lens[bi]
-                batch_seq[bi, -t:, :, :, :] = states_buf[i][:t]  # left-pad zeros
+                batch_seq[bi, -t:, :, :, :] = states_buf[i][:t]
 
             with torch.inference_mode():
                 logits_batch, _ = policy_net(batch_seq)  # (B_alive, T_max, A)
-                # last valid timestep per env is always index -1 after left-padding
                 logits_last = logits_batch[:, -1, :]     # (B_alive, A)
 
-            # sample actions for all alive envs at once
             dist = torch.distributions.Categorical(logits=logits_last)
-            actions_alive = dist.sample().detach().cpu().numpy().astype(np.int64)  # (B_alive,)
+            actions_alive = dist.sample().detach().cpu().numpy().astype(np.int64)
 
-            # record behavior logits for each env at this step
             for bi, i in enumerate(alive_indices):
                 beh_logits_buf[i].append(logits_last[bi].detach().cpu())
 
@@ -219,17 +281,15 @@ def _collect_explore_vec(
             if B_alive >= 2:
                 fwd_calls_batched += 1
 
-            # Build full action array for vector env step
+            # vectorized env step
+            t_env_start = _time.time()
             actions = np.zeros((n,), dtype=np.int64)
             for bi, i in enumerate(alive_indices):
                 actions[i] = actions_alive[bi]
-
-            # ---- Vectorized env step ----
-            t_env_start = _time.time()
             obs_batch, rew_batch, term_batch, trunc_batch, info_batch = vec_env.step(actions)
             t_env += (_time.time() - t_env_start)
 
-            # ---- Bookkeeping ----
+            # bookkeeping
             for bi, i in enumerate(alive_indices):
                 rewards_list[i].append(float(rew_batch[i]))
                 actions_list[i].append(int(actions[i]))
@@ -237,34 +297,29 @@ def _collect_explore_vec(
                 last_r[i] = float(rew_batch[i])
                 last_obs[i] = obs_batch[i]
                 steps_i[i] += 1
-
                 if steps_i[i] >= max_steps or bool(term_batch[i]) or bool(trunc_batch[i]):
                     alive[i] = False
                     n_alive -= 1
 
-            # guard: all hit max
             if all(si >= max_steps for si in steps_i):
                 break
 
-        # ---- Sanity / timing summary ----
-        elapsed = _time.time() - t0_total
-        total_steps = sum(steps_i)
-        avg_fwd_batch = (fwd_batch_size_accum / max(fwd_calls_total, 1))
-        # logger.info(
-        #     "[VEC] explore collect: async=%s n_envs=%d total_env_steps=%d "
-        #     "elapsed=%.2fs (env_step=%.2fs, net=%.2fs) throughput=%.1f steps/s steps_per_env=%s "
-        #     "| fwd_calls=%d batched_calls=%d (%.1f%%) avg_fwd_batch=%.2f",
-        #     str(bool(is_async)), n, total_steps,
-        #     elapsed, t_env, t_net,
-        #     (total_steps / max(elapsed, 1e-6)), str(steps_i),
-        #     fwd_calls_total, fwd_calls_batched, 100.0 * (fwd_calls_batched / max(fwd_calls_total, 1)),
-        #     avg_fwd_batch,
-        # )
-        if n > 1 and fwd_calls_batched == 0:
-            logger.warning("[VEC][SANITY] No batched policy forwards occurred (B_alive never >= 2). "
-                           "This indicates either immediate terminations or a batching bug.")
+        # [DBG] summary
+        if dbg:
+            elapsed = _time.time() - t0_total
+            total_steps = sum(steps_i)
+            avg_fwd_batch = (fwd_batch_size_accum / max(fwd_calls_total, 1))
+            logger.info(
+                "[VEC] explore collect done: envs=%d steps_total=%d elapsed=%.2fs env=%.2fs net=%.2fs "
+                "throughput=%.1f steps/s fwd_calls=%d batched_calls=%d (%.1f%%) avg_fwd_batch=%.2f",
+                n, total_steps, elapsed, t_env, t_net,
+                (total_steps / max(elapsed, 1e-6)), fwd_calls_total, fwd_calls_batched,
+                100.0 * (fwd_calls_batched / max(fwd_calls_total, 1)), avg_fwd_batch
+            )
+            if n > 1 and fwd_calls_batched == 0:
+                logger.warning("[VEC][SANITY] No batched policy forwards occurred (B_alive never >= 2).")
 
-        # Package results back to CPU
+        # package to CPU
         rollouts: List[ExploreRollout] = []
         for i in range(n):
             T_i = steps_i[i]
@@ -272,21 +327,12 @@ def _collect_explore_vec(
             actions = torch.tensor(actions_list[i], dtype=torch.long)
             rewards = torch.tensor(rewards_list[i], dtype=torch.float32)
             beh_logits = torch.stack(beh_logits_buf[i], dim=0).detach().cpu()
-            rollouts.append(
-                ExploreRollout(
-                    obs6=obs6,
-                    actions=actions,
-                    rewards=rewards,
-                    beh_logits=beh_logits,
-                    reuse_count=0,
-                )
-            )
+            rollouts.append(ExploreRollout(obs6=obs6, actions=actions, rewards=rewards, beh_logits=beh_logits, reuse_count=0))
 
         # explicit frees
         del states_buf, beh_logits_buf
         if device.type == "cuda":
             torch.cuda.empty_cache()
-
         return rollouts
 
     finally:
@@ -294,7 +340,6 @@ def _collect_explore_vec(
             vec_env.close()
         except Exception:
             pass
-
 
 
 # ---------- demo concat & mild augmentation ----------
@@ -420,17 +465,32 @@ def run_training():
     start_time = datetime.datetime.utcnow()
 
     # —— New knobs (safe defaults if not present in config) ——
-    nbc = int(getattr(args, "nbc", 8))  # number of BC (outer) steps per collected explore
-    bc_only_after_first = bool(getattr(args, "bc_only_after_first", False))  # RL only on k==0?
-    recompute_rl_each_outer = bool(getattr(args, "recompute_rl_each_outer", True))
-    # internal: max envs per vectorized collection batch (no CLI change)
-    _vec_cap = int(getattr(args, "num_envs", 8))
+    nbc = int(getattr(args, "nbc", 16))  # number of BC (outer) steps per collected explore
+    # MRI extras (not in config.py, use getattr defaults):
+    inner_lr = float(getattr(args, "inner_lr", 1e-3))
+    inner_trunc_T = getattr(args, "inner_trunc_T", None)  # e.g., 128 to truncate explore for inner loss
+    head_only_inner = bool(getattr(args, "head_only_inner", False))
+
+    # [DBG] logging flags (non-breaking)
+    debug = bool(getattr(args, "debug", True))
+    debug_level = str(getattr(args, "debug_level", "INFO")).upper()
+    debug_every_batches = int(getattr(args, "debug_every_batches", 1))
+    debug_tasks_per_batch = int(getattr(args, "debug_tasks_per_batch", 4))
+    debug_inner_per_task = bool(getattr(args, "debug_inner_per_task", False))
+    debug_mem = bool(getattr(args, "debug_mem", True))
+    debug_timing = bool(getattr(args, "debug_timing", True))
+    debug_shapes = bool(getattr(args, "debug_shapes", True))
+    _maybe_set_debug_level(debug, debug_level)
+
+    logger.info("[SETUP] debug=%s level=%s nbc=%d inner_lr=%.2e inner_trunc_T=%s head_only_inner=%s",
+                str(debug), debug_level, nbc, inner_lr, str(inner_trunc_T), str(head_only_inner))
 
     # Seeding
     random.seed(args.seed); np.random.seed(args.seed)
     torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    logger.info("[SETUP] seed=%d cudnn.deterministic=%s benchmark=%s", args.seed, True, False)
 
     os.makedirs(args.save_path, exist_ok=True)
     os.makedirs(args.load_path, exist_ok=True)
@@ -438,17 +498,20 @@ def run_training():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
+    logger.info("[DEVICE] device=%s amp=%s %s", device.type, str(use_amp), _cuda_mem("init", device))
 
     # Load tasks
     with open(args.train_trials) as f:
         tasks_all = json.load(f)
     task_index_to_dict = {i: t for i, t in enumerate(tasks_all)}
     task_hash_to_dict = {make_task_id(t): t for t in tasks_all}
+    logger.info("[DATA] loaded train_trials=%s num_tasks=%d", args.train_trials, len(tasks_all))
 
     # Load demo manifests
     demos_by_task = load_all_manifests(args.demo_root)
     if not demos_by_task:
         raise RuntimeError("No demo manifests found in demo_root.")
+    logger.info("[DATA] demo_root=%s tasks_with_demos=%d", args.demo_root, len(demos_by_task))
 
     # Build task list with phase-2 demo paths (use all)
     tasks = []
@@ -474,10 +537,12 @@ def run_training():
     n_val = min(len(tasks), args.val_size)
     val_tasks = tasks[:n_val]
     train_tasks = tasks[n_val:]
-    logger.info(f"[SPLIT] train={len(train_tasks)} val={len(val_tasks)}")
+    logger.info("[SPLIT] train=%d val=%d (val_size=%d)", len(train_tasks), len(val_tasks), n_val)
 
     # Model
     policy_net = build_model(seq_len=SEQ_LEN).to(device)
+    tot, trn = _count_params(policy_net)
+    logger.info("[MODEL] built model params total=%d trainable=%d", tot, trn)
 
     # BC init
     if args.bc_init:
@@ -544,8 +609,12 @@ def run_training():
     free_every = 8  # call empty_cache every N updates (CUDA only)
     updates_since_free = 0
 
+    if debug_shapes:
+        logger.info("[SHAPES] SEQ_LEN=%s", str(SEQ_LEN))
+
     for epoch in range(start_epoch + 1, args.epochs + 1):
         final_epoch = epoch
+        logger.info("========== [EPOCH %02d/%02d] ==========", epoch, args.epochs)
 
         # Encoder unfreeze boundary
         if have_encoder and args.freeze_encoder_warmup_epochs > 0 and epoch == (args.freeze_encoder_warmup_epochs + 1):
@@ -566,20 +635,25 @@ def run_training():
         num_batches = math.ceil(len(train_tasks) / max(1, args.batch_size))
         batch_indices = list(range(len(train_tasks)))
         random.shuffle(batch_indices)
+        logger.info("[TRAIN] num_batches=%d batch_size=%d", num_batches, args.batch_size)
 
         policy_net.train()
-        running_train_loss = 0.0
         running_bc = 0.0
-        running_rl = 0.0
-        running_ent = 0.0
+        running_inrl = 0.0  # monitor inner RL loss at θ (detached)
         count_updates = 0
 
         pbar = tqdm(range(num_batches), desc=f"[Epoch {epoch:02d}] train", leave=False)
         for b in pbar:
+            is_verbose_batch = debug and ((b % max(1, debug_every_batches)) == 0)
+            btimer = _timer() if debug_timing else None
+
             start = b * args.batch_size
             end = min(len(train_tasks), (b + 1) * args.batch_size)
             batch_ids = [batch_indices[i] for i in range(start, end)]
             batch_tasks = [train_tasks[i] for i in batch_ids]
+            if is_verbose_batch:
+                tids = [t["task_id"] for t in batch_tasks]
+                logger.info("[BATCH %d/%d] tasks=%s", b+1, num_batches, tids)
 
             # ---- Vectorized collection for tasks that need a fresh explore ----
             need_collect = []
@@ -587,68 +661,24 @@ def run_training():
                 tid = task["task_id"]
                 if tid not in explore_cache or explore_cache[tid].reuse_count >= args.explore_reuse_M:
                     need_collect.append(task)
-            # collect in chunks to cap the worker pool
+            _vec_cap = int(getattr(args, "num_envs", 8))
+            if is_verbose_batch:
+                logger.info("[COLLECT] need_collect=%d vec_cap=%d", len(need_collect), _vec_cap)
+
             for off in range(0, len(need_collect), max(1, _vec_cap)):
                 slice_tasks = need_collect[off: off + max(1, _vec_cap)]
                 cfgs = [MazeTaskManager.TaskConfig(**t["task_dict"]) for t in slice_tasks]
-                ro_list = _collect_explore_vec(policy_net, cfgs, device, max_steps=250, seed_base=args.seed + 100000 * epoch + 1000 * b + off)
+                ro_list = _collect_explore_vec(
+                    policy_net, cfgs, device, max_steps=250,
+                    seed_base=args.seed + 100000 * epoch + 1000 * b + off,
+                    dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level
+                )
                 for t, ro in zip(slice_tasks, ro_list):
                     explore_cache[t["task_id"]] = ro
-            
-            # =========================
-            # Batched RL precompute on exploration rollouts (for potential reuse)
-            # =========================
-            exp_list_dev = []
-            tids_in_minibatch = []
-            for task in batch_tasks:
-                tid = task["task_id"]
-                if tid not in explore_cache:
-                    # extremely defensive: if missing for any reason, collect once
-                    cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
-                    ro = _collect_explore_vec(
-                        policy_net, [cfg], device, max_steps=250,
-                        seed_base=args.seed + 424242
-                    ).pop()
-                    explore_cache[tid] = ro
-                exp_list_dev.append(explore_cache[tid].obs6.to(device, non_blocking=True))
-                tids_in_minibatch.append(tid)
-
-            if len(exp_list_dev) > 0:
-                batch_exp = _pad_stack_time(exp_list_dev)  # (B, T_max, 6, H, W)
-                t0_bfwd = time.time()
-                with autocast(device_type="cuda", enabled=use_amp):
-                    logits_batch_all, values_batch_all = policy_net(batch_exp)  # (B, T_max, A), (B, T_max, *)
-                bfwd_elapsed = time.time() - t0_bfwd
-
-                precomp_logits_by_tid: Dict[int, torch.Tensor] = {}
-                precomp_values_by_tid: Dict[int, torch.Tensor] = {}
-
-                T_list = [x.shape[0] for x in exp_list_dev]
-                for i, tid in enumerate(tids_in_minibatch):
-                    Ti = T_list[i]
-                    # logits -> (T_i, A)
-                    logits_i = logits_batch_all[i, -Ti:, :]
-                    # values -> (T_i,)
-                    values_i = values_batch_all[i]
-                    if values_i.dim() == 3:
-                        values_i = values_i[-Ti:, 0]
-                    elif values_i.dim() == 2:
-                        values_i = values_i[-Ti:, ]
-                    else:
-                        values_i = values_i.view(-1)[-Ti:]
-                    precomp_logits_by_tid[tid] = logits_i
-                    precomp_values_by_tid[tid] = values_i
-
-                Bsz = len(exp_list_dev)
-                T_max = max(T_list) if T_list else 0
-                T_avg = float(sum(T_list) / max(1, len(T_list)))
-                # logger.info(
-                #     "[BATCHFWD] RL precompute: B=%d T_max=%d T_avg=%.1f one_fwd=YES time=%.2fs",
-                #     Bsz, T_max, T_avg, bfwd_elapsed
-                # )
-            else:
-                precomp_logits_by_tid = {}
-                precomp_values_by_tid = {}
+                    if is_verbose_batch and debug_shapes:
+                        logger.info("[COLLECT] tid=%s Tx=%d obs6=%s actions=%s rewards=%s",
+                                    t["task_id"], ro.obs6.shape[0], _shape_str(ro.obs6),
+                                    _shape_str(ro.actions), _shape_str(ro.rewards))
 
             # =========================
             # BUILD per-task tensors ONCE (used across k outer steps)
@@ -656,20 +686,23 @@ def run_training():
             per_task_tensors: Dict[int, Dict[str, torch.Tensor]] = {}
             tasks_used: List[int] = []
 
-            for task in batch_tasks:
+            for idx_task, task in enumerate(batch_tasks):
                 tid = task["task_id"]
                 cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
 
-                # KL-based refresh against current policy if cache exists
                 did_refresh_kl = False
                 if tid in explore_cache:
                     with torch.no_grad():
                         seq_dev_tmp = explore_cache[tid].obs6.to(device, non_blocking=True).unsqueeze(0)
                         logits_all_tmp, _ = policy_net(seq_dev_tmp)  # (1,Tx,A)
                         cur_logits_tmp = logits_all_tmp[0] if logits_all_tmp.dim() == 3 else logits_all_tmp
-                        if mean_kl_logits(cur_logits_tmp, explore_cache[tid].beh_logits.to(device)).item() > args.kl_refresh_threshold:
-                            # recollect just this one (vec size = 1)
-                            ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250, seed_base=args.seed + 999999).pop()
+                        kl = mean_kl_logits(cur_logits_tmp, explore_cache[tid].beh_logits.to(device)).item()
+                        if is_verbose_batch and idx_task < debug_tasks_per_batch:
+                            logger.info("[KL] tid=%s mean_kl=%.4f thr=%.4f", tid, kl, args.kl_refresh_threshold)
+                        if kl > args.kl_refresh_threshold:
+                            ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250,
+                                                      seed_base=args.seed + 999999,
+                                                      dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
                             explore_cache[tid] = ro
                             did_refresh_kl = True
                     try:
@@ -679,93 +712,42 @@ def run_training():
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                 else:
-                    # if somehow still missing, collect once
-                    ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250, seed_base=args.seed + 424242).pop()
+                    ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250,
+                                              seed_base=args.seed + 424242,
+                                              dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
                     explore_cache[tid] = ro
 
-                # If KL refresh changed the rollout, drop any stale precompute for this tid
-                if did_refresh_kl:
-                    if tid in precomp_logits_by_tid:
-                        del precomp_logits_by_tid[tid]
-                    if tid in precomp_values_by_tid:
-                        del precomp_values_by_tid[tid]
-
                 # -------- Copy explore chunk to device --------
-                exp_six_dev  = explore_cache[tid].obs6.to(device, non_blocking=True)      # (Tx,6,H,W)
-                actions_x    = explore_cache[tid].actions.to(device, non_blocking=True)   # (Tx,)
-                rewards_x    = explore_cache[tid].rewards.to(device, non_blocking=True)   # (Tx,)
-                beh_logits_x = explore_cache[tid].beh_logits.to(device, non_blocking=True)# (Tx,A)
+                ro = explore_cache[tid]
+                exp_six_dev  = ro.obs6.to(device, non_blocking=True)      # (Tx,6,H,W)
+                actions_x    = ro.actions.to(device, non_blocking=True)   # (Tx,)
+                rewards_x    = ro.rewards.to(device, non_blocking=True)   # (Tx,)
+                beh_logits_x = ro.beh_logits.to(device, non_blocking=True)# (Tx,A)
                 Tx = exp_six_dev.shape[0]
 
-                # -------- RL baseline (k==0) for this task --------
-                with autocast(device_type="cuda", enabled=use_amp):
-                    use_precomp = False
-                    cur_logits_x0 = None
-                    values_x0 = None
-                    if (tid in precomp_logits_by_tid) and (tid in precomp_values_by_tid):
-                        cur_logits_x0 = precomp_logits_by_tid[tid]
-                        values_x0     = precomp_values_by_tid[tid]
-                        if cur_logits_x0.size(0) == Tx and values_x0.size(0) == Tx:
-                            use_precomp = True
-                    if not use_precomp:
-                        logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
-                        cur_logits_x0 = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
-                        values_x0 = values_x_all
-                        if values_x0.dim() == 3:
-                            values_x0 = values_x0[0, :, 0]
-                        elif values_x0.dim() == 2:
-                            values_x0 = values_x0[0]
-                        else:
-                            values_x0 = values_x0.squeeze()
-                        # Normalize shapes
-                        cur_logits_x0 = cur_logits_x0[-Tx:, :]
-                        values_x0 = values_x0.view(-1)[-Tx:]
-
-                    loss_rl_0, ent_x_0, _ = reinforce_with_baseline(
-                        cur_logits=cur_logits_x0,
-                        actions=actions_x,
-                        rewards=rewards_x,
-                        values=values_x0,
-                        gamma=args.gamma,
-                        lam=args.gae_lambda,
-                        use_gae=args.use_gae,
-                        entropy_coef=args.explore_entropy_coef,
-                        behavior_logits=beh_logits_x if args.offpolicy_correction != "none" else None,
-                        offpolicy=args.offpolicy_correction,
-                        is_clip_rho=args.is_clip_rho,
-                    )
-
-                # ESS refresh (based on taken actions)
+                # ESS refresh (based on taken actions) using current θ (no grad)
                 with torch.no_grad():
-                    lp_cur = torch.log_softmax(cur_logits_x0, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
+                    logits_now, _ = policy_net(exp_six_dev.unsqueeze(0))
+                    logits_now = logits_now[0] if logits_now.dim() == 3 else logits_now  # (Tx, A)
+                    lp_cur = torch.log_softmax(logits_now, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
                     lp_beh = torch.log_softmax(beh_logits_x, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
                     rhos = torch.exp(lp_cur - lp_beh)
                     ess_ratio = ess_ratio_from_rhos(rhos).item()
-                if args.explore_reuse_M > 1 and ess_ratio < args.ess_refresh_ratio:
-                    ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250, seed_base=args.seed + 31337).pop()
+                if is_verbose_batch and idx_task < debug_tasks_per_batch:
+                    logger.info("[ESS] tid=%s Tx=%d ess_ratio=%.3f thr=%.3f reuse_count=%d",
+                                tid, Tx, ess_ratio, args.ess_refresh_ratio, ro.reuse_count)
+                if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio < args.ess_refresh_ratio:
+                    ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250,
+                                              seed_base=args.seed + 31337,
+                                              dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
                     explore_cache[tid] = ro
                     exp_six_dev  = ro.obs6.to(device, non_blocking=True)
                     actions_x    = ro.actions.to(device, non_blocking=True)
                     rewards_x    = ro.rewards.to(device, non_blocking=True)
                     beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
                     Tx = exp_six_dev.shape[0]
-                    with autocast(device_type="cuda", enabled=use_amp):
-                        logits_x_all, values_x_all = policy_net(exp_six_dev.unsqueeze(0))
-                        cur_logits_x0 = logits_x_all[0] if logits_x_all.dim() == 3 else logits_x_all
-                        values_x0 = values_x_all
-                        if values_x0.dim() == 3:
-                            values_x0 = values_x0[0, :, 0]
-                        elif values_x0.dim() == 2:
-                            values_x0 = values_x0[0]
-                        else:
-                            values_x0 = values_x0.squeeze()
-                        cur_logits_x0 = cur_logits_x0[-Tx:, :]
-                        values_x0 = values_x0.view(-1)[-Tx:]
-                    # precomp no longer valid for this tid
-                    if tid in precomp_logits_by_tid:
-                        del precomp_logits_by_tid[tid]
-                    if tid in precomp_values_by_tid:
-                        del precomp_values_by_tid[tid]
+                    if is_verbose_batch and idx_task < debug_tasks_per_batch:
+                        logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
                 # -------- Build batched BC tensors from ALL demos (once) --------
                 prev_action_start = float(actions_x[-1].item()) if Tx > 0 else 0.0
@@ -785,7 +767,8 @@ def run_training():
                     demo_lab_list.append(labels_cat)
 
                 if len(demo_obs_list) == 0:
-                    # no supervised data for this task in this batch
+                    if is_verbose_batch and idx_task < debug_tasks_per_batch:
+                        logger.warning("[BC][SKIP] tid=%s no demos to supervise in this batch", tid)
                     continue
 
                 B_d = len(demo_obs_list)
@@ -805,164 +788,153 @@ def run_training():
                 batch_obs = torch.stack(pad_obs, dim=0)  # (B_d, T_max, 6,H,W)
                 batch_lab = torch.stack(pad_lab, dim=0)  # (B_d, T_max)
 
-                # Stash everything we need per task for the k-loop
-                per_task_tensors[tid] = {
-                    "batch_obs": batch_obs,
-                    "batch_lab": batch_lab,
-                    "loss_rl0": loss_rl_0,             # may carry graph if recompute=False and k==0
-                    "ent0": torch.as_tensor(ent_x_0).detach(),
-                }
-                if recompute_rl_each_outer:
-                    per_task_tensors[tid].update({
-                        "exp": exp_six_dev,
-                        "actions": actions_x,
-                        "rewards": rewards_x,
-                        "beh_logits": beh_logits_x,
-                    })
-                # else: do not store exp_* to save VRAM; we'll reuse loss_rl0
+                if is_verbose_batch and idx_task < debug_tasks_per_batch and debug_shapes:
+                    logger.info("[BC][BUILD] tid=%s B_d=%d T_max=%d obs=%s lab=%s",
+                                tid, B_d, T_max, _shape_str(batch_obs), _shape_str(batch_lab))
 
+                per_task_tensors[tid] = {
+                    "batch_obs": batch_obs,       # for BC outer at φ
+                    "batch_lab": batch_lab,
+                    "exp": exp_six_dev,           # for inner RL step (θ -> φ)
+                    "actions": actions_x,
+                    "rewards": rewards_x,
+                    "beh_logits": beh_logits_x,
+                }
                 tasks_used.append(tid)
 
             # =========================
             # OUTER LOOP: MRI-style (k steps over the whole minibatch)
             # =========================
             if len(tasks_used) == 0:
-                # No supervised data in this minibatch; skip optimizer work
                 continue
 
+            if is_verbose_batch and debug_mem:
+                logger.info("[MEM][PRE-K] %s", _cuda_mem("pre-k", device))
+
             for k in range(nbc):
+                ktimer = _timer() if debug_timing else None
+                params_theta_named, buffers_named = _named_params_and_buffers(policy_net)
+                if head_only_inner:
+                    head_theta_named, rest_theta_named = _split_params_head_vs_rest(params_theta_named)
+                else:
+                    head_theta_named, rest_theta_named = params_theta_named, {}
+
+                if is_verbose_batch and k == 0:
+                    logger.info("[INNER] k-loop=%d head_only=%s head_params=%d rest_params=%d",
+                                nbc, str(head_only_inner), len(head_theta_named), len(rest_theta_named))
+
+                loss_bc_list = []
+                inrl_monitor_sum = 0.0
+
                 optimizer.zero_grad(set_to_none=True)
-                total_loss = None
-                total_bc = 0.0
-                total_rl = 0.0
-                total_ent = 0.0
-                denom = 0
 
-                for tid in tasks_used:
+                for idx_task, tid in enumerate(tasks_used):
                     tensors = per_task_tensors[tid]
-                    batch_obs = tensors["batch_obs"]
-                    batch_lab = tensors["batch_lab"]
+                    exp = tensors["exp"]
+                    acts = tensors["actions"]
+                    rews = tensors["rewards"]
+                    beh  = tensors["beh_logits"]
 
-                    # --- RL term selection ---
-                    if bc_only_after_first:
-                        if k == 0:
-                            if recompute_rl_each_outer:
-                                with autocast(device_type="cuda", enabled=use_amp):
-                                    exp = tensors["exp"]
-                                    actions = tensors["actions"]
-                                    rewards = tensors["rewards"]
-                                    beh_logits = tensors["beh_logits"]
-                                    logits_x_all_k, values_x_all_k = policy_net(exp.unsqueeze(0))
-                                    cur_logits_x_k = logits_x_all_k[0] if logits_x_all_k.dim() == 3 else logits_x_all_k
-                                    values_x_k = values_x_all_k
-                                    if values_x_k.dim() == 3:
-                                        values_x_k = values_x_k[0, :, 0]
-                                    elif values_x_k.dim() == 2:
-                                        values_x_k = values_x_k[0]
-                                    else:
-                                        values_x_k = values_x_k.squeeze()
-                                    loss_rl_k, ent_x_k, _ = reinforce_with_baseline(
-                                        cur_logits=cur_logits_x_k,
-                                        actions=actions,
-                                        rewards=rewards,
-                                        values=values_x_k,
-                                        gamma=args.gamma,
-                                        lam=args.gae_lambda,
-                                        use_gae=args.use_gae,
-                                        entropy_coef=args.explore_entropy_coef,
-                                        behavior_logits=beh_logits if args.offpolicy_correction != "none" else None,
-                                        offpolicy=args.offpolicy_correction,
-                                        is_clip_rho=args.is_clip_rho,
-                                    )
-                            else:
-                                # use k=0 RL once; detach to avoid graph reuse issues
-                                loss_rl_k = tensors["loss_rl0"].detach()
-                                ent_x_k = float(tensors["ent0"]) if isinstance(tensors["ent0"], torch.Tensor) else float(tensors["ent0"])
-                        else:
-                            loss_rl_k = torch.tensor(0.0, device=device, dtype=torch.float32)
-                            ent_x_k = 0.0
-                    else:
-                        if recompute_rl_each_outer:
-                            with autocast(device_type="cuda", enabled=use_amp):
-                                exp = tensors["exp"]
-                                actions = tensors["actions"]
-                                rewards = tensors["rewards"]
-                                beh_logits = tensors["beh_logits"]
-                                logits_x_all_k, values_x_all_k = policy_net(exp.unsqueeze(0))
-                                cur_logits_x_k = logits_x_all_k[0] if logits_x_all_k.dim() == 3 else logits_x_all_k
-                                values_x_k = values_x_all_k
-                                if values_x_k.dim() == 3:
-                                    values_x_k = values_x_k[0, :, 0]
-                                elif values_x_k.dim() == 2:
-                                    values_x_k = values_x_k[0]
-                                else:
-                                    values_x_k = values_x_k.squeeze()
-                                loss_rl_k, ent_x_k, _ = reinforce_with_baseline(
-                                    cur_logits=cur_logits_x_k,
-                                    actions=actions,
-                                    rewards=rewards,
-                                    values=values_x_k,
-                                    gamma=args.gamma,
-                                    lam=args.gae_lambda,
-                                    use_gae=args.use_gae,
-                                    entropy_coef=args.explore_entropy_coef,
-                                    behavior_logits=beh_logits if args.offpolicy_correction != "none" else None,
-                                    offpolicy=args.offpolicy_correction,
-                                    is_clip_rho=args.is_clip_rho,
-                                )
-                        else:
-                            # reuse the precomputed value but DETACH so we don't backprop same graph multiple times
-                            if k == 0:
-                                loss_rl_k = tensors["loss_rl0"]
-                            else:
-                                loss_rl_k = tensors["loss_rl0"].detach()
-                            ent_x_k = float(tensors["ent0"]) if isinstance(tensors["ent0"], torch.Tensor) else float(tensors["ent0"])
+                    Tx_full = exp.shape[0]
+                    if inner_trunc_T is not None and isinstance(inner_trunc_T, int) and exp.shape[0] > inner_trunc_T:
+                        exp = exp[-inner_trunc_T:]
+                        acts = acts[-inner_trunc_T:]
+                        rews = rews[-inner_trunc_T:]
+                        beh  = beh[-inner_trunc_T:]
+                    if is_verbose_batch and idx_task < debug_tasks_per_batch and k == 0:
+                        logger.info("[INNER][TRUNC] tid=%s Tx_full=%d Tx_used=%d", tid, Tx_full, exp.shape[0])
 
-                    # --- BC term ---
+                    # (a) Inner RL loss at θ
                     with autocast(device_type="cuda", enabled=use_amp):
-                        logits_b, _ = policy_net(batch_obs)  # (B_d, T_max, A)
+                        logits_all, values_all = _functional_forward(
+                            policy_net,
+                            {**rest_theta_named, **head_theta_named},
+                            buffers_named,
+                            exp.unsqueeze(0)  # (1,Tx,6,H,W)
+                        )
+                        logits_x = logits_all[0]          # (Tx, A)
+                        values_x = values_all[0]          # (Tx,)
+
+                        loss_in, ent_x, _ = reinforce_with_baseline(
+                            cur_logits=logits_x,
+                            actions=acts,
+                            rewards=rews,
+                            values=values_x,
+                            gamma=args.gamma, lam=args.gae_lambda, use_gae=args.use_gae,
+                            entropy_coef=args.explore_entropy_coef,
+                            behavior_logits=(beh if args.offpolicy_correction!="none" else None),
+                            offpolicy=args.offpolicy_correction,
+                            is_clip_rho=args.is_clip_rho,
+                        )
+
+                    inrl_monitor_sum += float(loss_in.detach().cpu())
+                    if is_verbose_batch and debug_inner_per_task and idx_task < debug_tasks_per_batch:
+                        logger.info("[INNER][LOSS] k=%d tid=%s inrl=%.4f ent=%.4f", k, tid, float(loss_in), float(ent_x))
+
+                    # (b) One differentiable inner step: θ -> φ on head params
+                    grads = torch.autograd.grad(
+                        loss_in, tuple(head_theta_named.values()), create_graph=True, allow_unused=False
+                    )
+                    if is_verbose_batch and idx_task == 0 and k == 0:
+                        n_nan = sum((not _finite(g)) for g in grads if isinstance(g, torch.Tensor))
+                        if n_nan > 0:
+                            logger.warning("[GRAD][NONFINITE] inner grads contain %d non-finite entries", n_nan)
+                    phi_head = {kname: w - inner_lr * g for (kname, w), g in zip(head_theta_named.items(), grads)}
+
+                    # (c) Evaluate BC at φ
+                    with autocast(device_type="cuda", enabled=use_amp):
+                        phi_params = {**rest_theta_named, **phi_head}
+                        logits_b, _ = _functional_forward(policy_net, phi_params, buffers_named, tensors["batch_obs"])
                         if args.label_smoothing > 0.0:
                             loss_bc_k = smoothed_cross_entropy(
-                                logits_b, batch_lab,
-                                ignore_index=PAD_ACTION, smoothing=args.label_smoothing
+                                logits_b, tensors["batch_lab"], ignore_index=PAD_ACTION, smoothing=args.label_smoothing
                             )
                         else:
                             ce = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
-                            loss_bc_k = ce(logits_b.reshape(-1, logits_b.size(-1)), batch_lab.reshape(-1))
+                            loss_bc_k = ce(logits_b.reshape(-1, logits_b.size(-1)), tensors["batch_lab"].reshape(-1))
 
-                        loss_task = args.rl_coef * loss_rl_k + loss_bc_k
+                    loss_bc_list.append(loss_bc_k)
 
-                    total_loss = loss_task if (total_loss is None) else (total_loss + loss_task)
-                    total_bc += float(loss_bc_k.detach().cpu())
-                    total_rl += float(loss_rl_k.detach().cpu()) if isinstance(loss_rl_k, torch.Tensor) else float(loss_rl_k)
-                    total_ent += float(ent_x_k)
-                    denom += 1
-
-                if denom == 0:
+                if len(loss_bc_list) == 0:
                     continue
 
-                avg_loss = total_loss / float(denom)
+                total_bc = sum(loss_bc_list) / float(len(loss_bc_list))
+                avg_loss = total_bc
 
+                # Backprop
                 scaler.scale(avg_loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                # capture grad norm
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
+                if not torch.isfinite(grad_norm):
+                    logger.warning("[GRAD][NONFINITE] grad_norm=%s — skipping optimizer step", str(grad_norm))
+                    optimizer.zero_grad(set_to_none=True)
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
 
-                running_train_loss += float(avg_loss.detach().cpu())
-                running_bc         += (total_bc / denom)
-                running_rl         += (total_rl / denom)
-                running_ent        += (total_ent / denom)
-                count_updates      += 1
-                updates_since_free += 1
-
-                # mark reuse for explore refresh gating
+                # reuse count
                 for tid in tasks_used:
                     explore_cache[tid].reuse_count += 1
 
-                if device.type == "cuda" and updates_since_free >= free_every:
-                    torch.cuda.empty_cache()
-                    updates_since_free = 0
+                # stats
+                running_bc += float(total_bc.detach().cpu())
+                running_inrl += inrl_monitor_sum / max(1, len(tasks_used))
+                count_updates += 1
+
+                if device.type == "cuda":
+                    updates_since_free += 1
+                    if updates_since_free >= free_every:
+                        torch.cuda.empty_cache()
+                        updates_since_free = 0
+
+                if is_verbose_batch:
+                    msg = f"[STEP] k={k+1}/{nbc} avg_bc={float(total_bc):.4f} inrl@theta(avg)={inrl_monitor_sum/max(1,len(tasks_used)):.4f} grad_norm={float(grad_norm):.3f}"
+                    if debug_mem:
+                        msg += " | " + _cuda_mem("post-step", device)
+                    if debug_timing and ktimer is not None:
+                        msg += f" | step_time={ktimer():.3f}s"
+                    logger.info(msg)
 
             # --------- free per-batch tensors ----------
             for tid in tasks_used:
@@ -974,20 +946,27 @@ def run_training():
                 torch.cuda.empty_cache()
 
             if count_updates > 0:
-                pbar.set_postfix(loss=f"{running_train_loss/max(1,count_updates):.3f}",
-                                 bc=f"{running_bc/max(1,count_updates):.3f}",
-                                 rl=f"{running_rl/max(1,count_updates):.3f}",
-                                 ent=f"{running_ent/max(1,count_updates):.3f}")
+                pbar.set_postfix(
+                    bc=f"{running_bc/max(1,count_updates):.3f}",
+                    inrl=f"{running_inrl/max(1,count_updates):.3f}"
+                )
+
+            if is_verbose_batch and debug_timing and btimer is not None:
+                logger.info("[BATCH %d] elapsed=%.3fs", b+1, btimer())
 
         # ------- Validation (rollout) -------
         policy_net.eval()
         with torch.no_grad():
+            vtimer = _timer() if debug_timing else None
             (val_results, avg_p1, avg_p2, std_p1, std_p2, avg_total, success_rate) = eval_sampled_val(
                 policy_net, val_tasks, val_env, device, sample_n=args.val_sample_size
             )
+            if debug and debug_timing and vtimer is not None:
+                logger.info("[VAL] elapsed=%.3fs", vtimer())
 
         logger.info(
-            f"[Epoch {epoch:02d}] train_loss={running_train_loss/max(1,count_updates):.4f} "
+            f"[Epoch {epoch:02d}] bc_outer={running_bc/max(1,count_updates):.4f} "
+            f"inrl@theta={running_inrl/max(1,count_updates):.4f} "
             f"val_phase1={avg_p1:.2f}±{std_p1:.2f} val_phase2={avg_p2:.2f}±{std_p2:.2f} "
             f"success_rate={success_rate:.2f} avg_total_steps={avg_total:.2f}"
         )
@@ -998,17 +977,19 @@ def run_training():
             best_val_score, best_epoch = avg_total, epoch
             patience, improved, improved_this = 0, True, True
             save_checkpoint(policy_net, epoch, best_val_score, args.save_path, args.load_path)
+            logger.info("[CKPT] improved avg_total -> %.2f (epoch %d)", best_val_score, best_epoch)
         else:
             patience += (0 if getattr(args, "disable_early_stop", False) else 1)
 
         if getattr(args, "disable_early_stop", False) and not improved_this:
             save_checkpoint(policy_net, epoch, best_val_score, args.save_path, args.load_path)
+            logger.info("[CKPT] saved (no early-stop) best=%.2f epoch=%d", best_val_score, best_epoch)
 
         if (not getattr(args, "disable_early_stop", False)) and patience >= args.early_stop_patience and not improved_this:
             logger.info(f"[EARLY STOP] no improvement for {patience} epochs, stopping.")
             break
 
-    logger.info("BC meta training (vectorized explore) complete.")
+    logger.info("BC meta training (MRI-style inner step; vectorized explore) complete.")
 
 if __name__ == "__main__":
     run_training()
