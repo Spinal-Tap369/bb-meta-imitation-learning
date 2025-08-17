@@ -816,13 +816,14 @@ def run_training():
             if is_verbose_batch and debug_mem:
                 logger.info("[MEM][PRE-K] %s", _cuda_mem("pre-k", device))
 
-            for k in range(nbc):
+            for step_idx in range(nbc):
                 ktimer = _timer() if debug_timing else None
                 params_theta_named, buffers_named = _named_params_and_buffers(policy_net)
                 # Split trainable vs frozen (handles encoder warmup safely)
                 trainable_named, frozen_named = _split_trainable(params_theta_named)
                 if head_only_inner:
-                    head_theta_named, _ = _split_params_head_vs_rest(params_theta_named)
+                    # only adapt TRAINABLE head params
+                    head_theta_named, _ = _split_params_head_vs_rest(trainable_named)
                 else:
                     head_theta_named = trainable_named
                 
@@ -837,7 +838,7 @@ def run_training():
                         f"trainable={len(trainable_named)} frozen={len(frozen_named)}"
                     )
 
-                if is_verbose_batch and k == 0:
+                if is_verbose_batch and step_idx == 0:
                     logger.info("[INNER] k-loop=%d head_only=%s head_params=%d rest_params=%d",
                                 nbc, str(head_only_inner), len(head_theta_named), len(rest_theta_named))
 
@@ -859,7 +860,7 @@ def run_training():
                         acts = acts[-inner_trunc_T:]
                         rews = rews[-inner_trunc_T:]
                         beh  = beh[-inner_trunc_T:]
-                    if is_verbose_batch and idx_task < debug_tasks_per_batch and k == 0:
+                    if is_verbose_batch and idx_task < debug_tasks_per_batch and step_idx == 0:
                         logger.info("[INNER][TRUNC] tid=%s Tx_full=%d Tx_used=%d", tid, Tx_full, exp.shape[0])
 
                     # (a) Inner RL loss at θ
@@ -887,23 +888,23 @@ def run_training():
 
                     inrl_monitor_sum += float(loss_in.detach().cpu())
                     if is_verbose_batch and debug_inner_per_task and idx_task < debug_tasks_per_batch:
-                        logger.info("[INNER][LOSS] k=%d tid=%s inrl=%.4f ent=%.4f", k, tid, float(loss_in), float(ent_x))
+                        logger.info("[INNER][LOSS] k=%d tid=%s inrl=%.4f ent=%.4f", step_idx, tid, float(loss_in), float(ent_x))
 
                     # (b) One differentiable inner step: θ -> φ on head params
                     grads = torch.autograd.grad(
                         loss_in, tuple(head_theta_named.values()), create_graph=True, allow_unused=True
                     )
-                    if is_verbose_batch and idx_task == 0 and k == 0:
+                    if is_verbose_batch and idx_task == 0 and step_idx == 0:
                         n_nan = sum((not _finite(g)) for g in grads if isinstance(g, torch.Tensor))
                         if n_nan > 0:
                             logger.warning("[GRAD][NONFINITE] inner grads contain %d non-finite entries", n_nan)
                     phi_head = {}
-                    for (k, w), g in zip(head_theta_named.items(), grads):
+                    for (pname, w), g in zip(head_theta_named.items(), grads):
                         if g is None:
                             if bool(getattr(args, "debug", True)):
-                                logger.warning(f"[INNER][GRAD] None grad for '{k}'; using zeros")
+                                logger.warning(f"[INNER][GRAD] None grad for '{pname}'; using zeros")
                             g = torch.zeros_like(w)
-                        phi_head[k] = w - inner_lr * g
+                        phi_head[pname] = w - inner_lr * g
 
                     # (c) Evaluate BC at φ
                     with autocast(device_type="cuda", enabled=use_amp):
@@ -953,7 +954,7 @@ def run_training():
                         updates_since_free = 0
 
                 if is_verbose_batch:
-                    msg = f"[STEP] k={k+1}/{nbc} avg_bc={float(total_bc):.4f} inrl@theta(avg)={inrl_monitor_sum/max(1,len(tasks_used)):.4f} grad_norm={float(grad_norm):.3f}"
+                    msg = f"[STEP] k={step_idx+1}/{nbc} avg_bc={float(total_bc):.4f} inrl@theta(avg)={inrl_monitor_sum/max(1,len(tasks_used)):.4f} grad_norm={float(grad_norm):.3f}"
                     if debug_mem:
                         msg += " | " + _cuda_mem("post-step", device)
                     if debug_timing and ktimer is not None:
