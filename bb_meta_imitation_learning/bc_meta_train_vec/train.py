@@ -419,7 +419,7 @@ def _maybe_augment_demo_six_cpu(p2_six_cpu: torch.Tensor, args) -> torch.Tensor:
     p2_six_cpu: (T,6,H,W) on CPU, float in [0,1] for RGB channels.
     Only augment channels [0:3] (RGB). Action/reward/boundary left untouched.
     """
-    if not bool(getattr(args, "use_aug", True)):
+    if not bool(getattr(args, "use_aug", False)):
         return p2_six_cpu
     if np.random.rand() > float(getattr(args, "aug_prob", 0.5)):
         return p2_six_cpu
@@ -472,8 +472,8 @@ def run_training():
     # —— New knobs (safe defaults if not present in config) ——
     nbc = int(getattr(args, "nbc", 16))  # number of BC (outer) steps per collected explore
     # MRI extras (not in config.py, use getattr defaults):
-    inner_lr = float(getattr(args, "inner_lr", 1e-3))
-    inner_trunc_T = getattr(args, "inner_trunc_T", None)  # e.g., 128 to truncate explore for inner loss
+    inner_lr = float(getattr(args, "inner_lr", 1e-4))
+    inner_trunc_T = getattr(args, "inner_trunc_T", 128)  # e.g., 128 to truncate explore for inner loss
     head_only_inner = bool(getattr(args, "head_only_inner", False))
 
     # [DBG] logging flags (non-breaking)
@@ -831,12 +831,12 @@ def run_training():
                 rest_theta_named = {**frozen_named, **{k: v for k, v in params_theta_named.items() if k not in head_theta_named}}
 
                 # Debug logging
-                if bool(getattr(args, "debug", True)):
-                    logger.info(
-                        f"[INNER] k-loop={nbc} head_only={head_only_inner} "
-                        f"head_params={len(head_theta_named)} rest_params={len(rest_theta_named)} "
-                        f"trainable={len(trainable_named)} frozen={len(frozen_named)}"
-                    )
+                # if bool(getattr(args, "debug", True)):
+                #     logger.info(
+                #         f"[INNER] k-loop={nbc} head_only={head_only_inner} "
+                #         f"head_params={len(head_theta_named)} rest_params={len(rest_theta_named)} "
+                #         f"trainable={len(trainable_named)} frozen={len(frozen_named)}"
+                #     )
 
                 if is_verbose_batch and step_idx == 0:
                     logger.info("[INNER] k-loop=%d head_only=%s head_params=%d rest_params=%d",
