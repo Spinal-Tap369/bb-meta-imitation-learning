@@ -473,8 +473,8 @@ def run_training():
     nbc = int(getattr(args, "nbc", 16))  # number of BC (outer) steps per collected explore
     # MRI extras (not in config.py, use getattr defaults):
     inner_lr = float(getattr(args, "inner_lr", 1e-4))
-    inner_trunc_T = getattr(args, "inner_trunc_T", 128)  # e.g., 128 to truncate explore for inner loss
-    head_only_inner = bool(getattr(args, "head_only_inner", False))
+    inner_trunc_T = getattr(args, "inner_trunc_T", 250)  # e.g., 128 to truncate explore for inner loss
+    head_only_inner = bool(getattr(args, "head_only_inner", True))
 
     # [DBG] logging flags (non-breaking)
     debug = bool(getattr(args, "debug", False))
