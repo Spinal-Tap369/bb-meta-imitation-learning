@@ -1,4 +1,4 @@
-# bc_meta_train_vec/config.py
+# plastic_train/config.py
 
 import argparse
 
@@ -18,12 +18,12 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-5)
-    p.add_argument("--nbc", type=int, default=8, help="BC refinement steps per collected explore rollout")
+    p.add_argument("--nbc", type=int, default=8, help="BC refinement steps per collected explore")
 
     # Loss / regularization
     p.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing for exploitation BC")
     p.add_argument("--explore_entropy_coef", type=float, default=5e-3, help="Entropy coefficient on exploration")
-    p.add_argument("--rl_coef", type=float, default=1.0, help="Weight on the RL loss (exploration)")
+    p.add_argument("--rl_coef", type=float, default=1.0, help="Weight on the RL loss (exploration) [grad mode only]")
 
     # RL (REINFORCE + baseline)
     p.add_argument("--gamma", type=float, default=0.99)
@@ -50,6 +50,25 @@ def parse_args():
     # Vectorization
     p.add_argument("--num_envs", type=int, default=8, help="Number of parallel envs for vectorized exploration")
 
-    p.add_argument("--head_only_inner", type=bool, default=True, help="Does inner updates update just the head or the entire n/w")
+    # Inner update mode
+    p.add_argument("--inner_mode", type=str, default="grad", choices=["grad", "plastic"], help="Inner adaptation: gradient or plastic")
+    p.add_argument("--head_only_inner", type=bool, default=True, help="(grad mode) update just the head in the inner step")
+
+    # Plastic knobs (used when --inner_mode plastic)
+    p.add_argument("--plastic_rule", type=str, default="oja", choices=["hebb", "oja"])
+    p.add_argument("--plastic_mod", type=str, default="adv", choices=["adv","td","reward","const"])
+    p.add_argument("--plastic_eta", type=float, default=0.1)
+    p.add_argument("--plastic_learn_eta", action="store_true")
+    p.add_argument("--plastic_clip_mod", type=float, default=2.0)
+
+    # Debug (optional)
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--debug_level", type=str, default="INFO")
+    p.add_argument("--debug_every_batches", type=int, default=1)
+    p.add_argument("--debug_tasks_per_batch", type=int, default=4)
+    p.add_argument("--debug_inner_per_task", action="store_true")
+    p.add_argument("--debug_mem", action="store_true")
+    p.add_argument("--debug_timing", action="store_true")
+    p.add_argument("--debug_shapes", action="store_true")
 
     return p.parse_args()
