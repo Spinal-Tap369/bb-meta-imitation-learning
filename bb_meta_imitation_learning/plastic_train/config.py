@@ -18,17 +18,23 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-5)
-    p.add_argument("--nbc", type=int, default=8, help="BC refinement steps per collected explore")
+    p.add_argument("--nbc", type=int, default=8, help="BC refinement steps per collected explore (outer steps)")
 
     # Loss / regularization
     p.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing for exploitation BC")
     p.add_argument("--explore_entropy_coef", type=float, default=5e-3, help="Entropy coefficient on exploration")
     p.add_argument("--rl_coef", type=float, default=1.0, help="Weight on the RL loss (exploration) [grad mode only]")
+    p.add_argument("--outer_pg_coef", type=float, default=0.0, help="Optional extra PG term in the OUTER loss (default 0.0 keeps BC-only outer)")
 
     # RL (REINFORCE + baseline)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae_lambda", type=float, default=1.0, help="GAE lambda (1.0 = Monte Carlo)")
     p.add_argument("--use_gae", action="store_true", help="Use GAE(lambda) on exploration")
+    p.add_argument("--adv_norm", action="store_true", help="Normalize advantages per-trajectory (recommended)")
+
+    # Reward preprocessing (helps stability)
+    p.add_argument("--rew_scale", type=float, default=1.0, help="Scale rewards before returns/advantage")
+    p.add_argument("--rew_clip", type=float, default=10.0, help="Clip rewards to [-rew_clip, rew_clip] before returns")
 
     # Exploration rollout reuse
     p.add_argument("--explore_reuse_M", type=int, default=1, help="Reuse count for the same phase-1 rollout (1=no reuse)")
@@ -40,6 +46,12 @@ def parse_args():
     # Encoder schedule
     p.add_argument("--freeze_encoder_warmup_epochs", type=int, default=2)
     p.add_argument("--encoder_lr_mult", type=float, default=0.1)
+
+    # Critic (value function) training
+    p.add_argument("--critic_aux_steps", type=int, default=1, help="Auxiliary critic-only regression steps per batch")
+    p.add_argument("--critic_lr_mult", type=float, default=1.0, help="LR multiplier for critic head optimizer")
+    p.add_argument("--critic_value_clip", type=float, default=0.0, help="If >0, clip value deltas like PPO value clip (stability)")
+    p.add_argument("--critic_in_inner", action="store_true", help="Include critic head in MRI inner update (off by default)")
 
     # Validation / early stopping
     p.add_argument("--val_size", type=int, default=10)
@@ -72,3 +84,4 @@ def parse_args():
     p.add_argument("--debug_shapes", action="store_true")
 
     return p.parse_args()
+
