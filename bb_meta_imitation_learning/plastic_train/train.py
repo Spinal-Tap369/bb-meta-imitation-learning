@@ -1,5 +1,7 @@
 # plastic_train/train.py
 
+# plastic_train/train.py
+
 import os
 import sys
 import json
@@ -162,6 +164,48 @@ def _outer_pg_term(policy_net: nn.Module,
     return ( - (rho * logp_cur * adv_norm).mean() ).detach()
 
 
+# ---------- vectorized recollect helper ----------
+def _recollect_batch_for_sign(
+    policy_net: nn.Module,
+    per_task_tensors: Dict[int, Dict[str, torch.Tensor]],
+    tasks_used: List[int],
+    device: torch.device,
+    seed_base: int,
+    vec_cap: int,
+    dbg: bool = False,
+    dbg_timing: bool = False,
+    dbg_level: str = "WARNING",
+) -> Dict[int, ExploreRollout]:
+    """
+    Recollect phase-1 rollouts for a set of tasks using vectorized envs.
+
+    We keep CRN by using the *same* seed_base for the +/- pair, and a deterministic
+    offset per chunk (off) so that the mapping is stable across both signs.
+
+    Returns:
+        dict {tid -> ExploreRollout}
+    """
+    ros_by_tid: Dict[int, ExploreRollout] = {}
+    if not tasks_used:
+        return ros_by_tid
+
+    all_cfgs = [MazeTaskManager.TaskConfig(**per_task_tensors[tid]["task_dict"]) for tid in tasks_used]
+    step = max(1, int(vec_cap))
+
+    for off in range(0, len(all_cfgs), step):
+        cfgs = all_cfgs[off: off + step]
+        ro_list = collect_explore_vec(
+            policy_net, cfgs, device, max_steps=250,
+            seed_base=seed_base + off,
+            dbg=dbg, dbg_timing=dbg_timing, dbg_level=dbg_level
+        )
+        slice_tids = tasks_used[off: off + step]
+        for tid, ro in zip(slice_tids, ro_list):
+            ros_by_tid[tid] = ro
+
+    return ros_by_tid
+
+
 # ---------- training loop ----------
 def run_training():
     from .remap import remap_pretrained_state  # local import to keep module edges clean
@@ -206,7 +250,6 @@ def run_training():
     logger.info("[DATA] loaded train_trials=%s num_tasks=%d", args.train_trials, len(tasks_all))
 
     # Load demo manifests
-    from .utils import load_all_manifests
     demos_by_task = load_all_manifests(args.demo_root)
     if not demos_by_task:
         raise RuntimeError("No demo manifests found in demo_root.")
@@ -600,6 +643,7 @@ def run_training():
                                     len(named_params))
 
                     es_grads = {n: torch.zeros_like(p) for n, p in named_params.items()}
+                    vec_cap = int(getattr(args, "num_envs", 8))  # capacity for vectorized recollects
 
                     # Population loop (antithetic)
                     for i in range(int(getattr(args, "es_popsize", 8))):
@@ -611,16 +655,18 @@ def run_training():
                         # -------- f(θ + σ ε)
                         with PerturbContext(named_params, eps, getattr(args, "es_sigma", 0.02), +1):
                             bc_list_plus = []
+                            ros_plus_by_tid: Dict[int, ExploreRollout] = {}
+                            if getattr(args, "es_recollect_inner", False):
+                                seed_for_pair = (pair_seed if pair_seed is not None else args.seed + 99991 + i)
+                                ros_plus_by_tid = _recollect_batch_for_sign(
+                                    policy_net, per_task_tensors, tasks_used, device,
+                                    seed_base=seed_for_pair, vec_cap=vec_cap,
+                                    dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level
+                                )
+
                             for tid in tasks_used:
                                 t = per_task_tensors[tid]
-                                ro_plus = t["ro"]
-                                if getattr(args, "es_recollect_inner", False):
-                                    cfg = MazeTaskManager.TaskConfig(**t["task_dict"])
-                                    ro_plus = collect_explore_vec(
-                                        policy_net, [cfg], device, max_steps=250,
-                                        seed_base=(pair_seed if pair_seed is not None else args.seed + 99991 + i),
-                                        dbg=False, dbg_timing=False, dbg_level="WARNING"
-                                    ).pop()
+                                ro_plus = ros_plus_by_tid.get(tid, t["ro"])
 
                                 if use_pg_inner:
                                     bc_phi = meta_objective_with_inner_pg(
@@ -660,16 +706,18 @@ def run_training():
                         # -------- f(θ - σ ε)
                         with PerturbContext(named_params, eps, getattr(args, "es_sigma", 0.02), -1):
                             bc_list_minus = []
+                            ros_minus_by_tid: Dict[int, ExploreRollout] = {}
+                            if getattr(args, "es_recollect_inner", False):
+                                seed_for_pair = (pair_seed if pair_seed is not None else args.seed + 99991 + i)
+                                ros_minus_by_tid = _recollect_batch_for_sign(
+                                    policy_net, per_task_tensors, tasks_used, device,
+                                    seed_base=seed_for_pair, vec_cap=vec_cap,
+                                    dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level
+                                )
+
                             for tid in tasks_used:
                                 t = per_task_tensors[tid]
-                                ro_minus = t["ro"]
-                                if getattr(args, "es_recollect_inner", False):
-                                    cfg = MazeTaskManager.TaskConfig(**t["task_dict"])
-                                    ro_minus = collect_explore_vec(
-                                        policy_net, [cfg], device, max_steps=250,
-                                        seed_base=(pair_seed if pair_seed is not None else args.seed + 99991 + i),
-                                        dbg=False, dbg_timing=False, dbg_level="WARNING"
-                                    ).pop()
+                                ro_minus = ros_minus_by_tid.get(tid, t["ro"])
 
                                 if use_pg_inner:
                                     bc_phi = meta_objective_with_inner_pg(
