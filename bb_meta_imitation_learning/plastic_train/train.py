@@ -577,16 +577,19 @@ def run_training():
                     es_grads = {n: torch.zeros_like(p) for n, p in named_params.items()}
 
                     # Population loop (antithetic)
+                    # Population loop (antithetic)
                     for i in range(int(args.es_popsize)):
                         eps = sample_eps(named_params, "spsa" if args.es_algo == "spsa" else "es")
 
-                        # Evaluate f(θ + σ ε)
+                        # -------- f(θ + σ ε)
                         with PerturbContext(named_params, eps, args.es_sigma, +1):
                             bc_list_plus = []
                             pg_list_plus = []
                             for tid in tasks_used:
                                 t = per_task_tensors[tid]
-                                bc_phi = meta_objective_from_rollout(policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device)
+                                bc_phi = meta_objective_from_rollout(
+                                    policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device
+                                )
                                 bc_list_plus.append(bc_phi)
                                 if args.outer_pg_coef and args.outer_pg_coef > 0.0:
                                     rews = torch.clamp(t["rewards"] * args.rew_scale, -args.rew_clip, args.rew_clip)
@@ -595,22 +598,24 @@ def run_training():
 
                             f_plus = torch.stack(bc_list_plus).mean()
                             if args.outer_pg_coef and args.outer_pg_coef > 0.0 and len(pg_list_plus) > 0:
-                                # Δ gate computed against bc_theta@base (one per task)
-                                deltas = torch.stack([bc_theta_map[tid] - bc for tid, bc in zip(tasks_used, bc_list_minus)])
-                                std = deltas.std(unbiased=False).clamp_min(1e-6)
-                                dnorm = torch.clamp((deltas - deltas.mean()) / std, -2.0, 2.0)
+                                # Δ-gate computed against bc@θ (no plastic)
+                                deltas_plus = torch.stack([bc_theta_map[tid] - bc for tid, bc in zip(tasks_used, bc_list_plus)])
+                                std_plus = deltas_plus.std(unbiased=False).clamp_min(1e-6)
+                                dnorm_plus = torch.clamp((deltas_plus - deltas_plus.mean()) / std_plus, -2.0, 2.0)
                                 if getattr(args, "delta_gate_relu", False):
-                                    dnorm = torch.relu(dnorm)
-                                pg_terms = torch.stack(pg_list_minus)
-                                f_minus = f_minus + args.outer_pg_coef * (dnorm * pg_terms).mean()
+                                    dnorm_plus = torch.relu(dnorm_plus)
+                                pg_terms_plus = torch.stack(pg_list_plus)
+                                f_plus = f_plus + args.outer_pg_coef * (dnorm_plus * pg_terms_plus).mean()
 
-                        # Evaluate f(θ - σ ε)
+                        # -------- f(θ - σ ε)
                         with PerturbContext(named_params, eps, args.es_sigma, -1):
                             bc_list_minus = []
                             pg_list_minus = []
                             for tid in tasks_used:
                                 t = per_task_tensors[tid]
-                                bc_phi = meta_objective_from_rollout(policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device)
+                                bc_phi = meta_objective_from_rollout(
+                                    policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device
+                                )
                                 bc_list_minus.append(bc_phi)
                                 if args.outer_pg_coef and args.outer_pg_coef > 0.0:
                                     rews = torch.clamp(t["rewards"] * args.rew_scale, -args.rew_clip, args.rew_clip)
@@ -619,18 +624,19 @@ def run_training():
 
                             f_minus = torch.stack(bc_list_minus).mean()
                             if args.outer_pg_coef and args.outer_pg_coef > 0.0 and len(pg_list_minus) > 0:
-                                deltas = torch.stack([bc_theta_map[tid] - bc for tid, bc in zip(tasks_used, bc_list_minus)])
-                                dnorm = (deltas - deltas.mean()) / dnorm.std().clamp_min(1e-6) if (dnorm := deltas.std()) else deltas*0.0  # safe
-                                dnorm = torch.clamp((deltas - deltas.mean()) / deltas.std().clamp_min(1e-6), -2.0, 2.0)
+                                deltas_minus = torch.stack([bc_theta_map[tid] - bc for tid, bc in zip(tasks_used, bc_list_minus)])
+                                std_minus = deltas_minus.std(unbiased=False).clamp_min(1e-6)
+                                dnorm_minus = torch.clamp((deltas_minus - deltas_minus.mean()) / std_minus, -2.0, 2.0)
                                 if getattr(args, "delta_gate_relu", False):
-                                    dnorm = torch.relu(dnorm)
-                                pg_terms = torch.stack(pg_list_minus)
-                                f_minus = f_minus + args.outer_pg_coef * (dnorm * pg_terms).mean()
+                                    dnorm_minus = torch.relu(dnorm_minus)
+                                pg_terms_minus = torch.stack(pg_list_minus)
+                                f_minus = f_minus + args.outer_pg_coef * (dnorm_minus * pg_terms_minus).mean()
 
+                        # ES gradient estimate: g += [(f+ - f-) / (2σ)] * ε
                         coeff = (f_plus - f_minus) / (2.0 * float(args.es_sigma))
-                        # Accumulate grads: g += coeff * ε
                         for n, p in named_params.items():
                             es_grads[n] = es_grads[n].add_(coeff * eps[n])
+
 
                     # Average over population
                     for n in es_grads:
