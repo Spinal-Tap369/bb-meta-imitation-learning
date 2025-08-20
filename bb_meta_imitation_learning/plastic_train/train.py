@@ -661,7 +661,7 @@ def run_training():
                                 ros_plus_by_tid = _recollect_batch_for_sign(
                                     policy_net, per_task_tensors, tasks_used, device,
                                     seed_base=seed_for_pair, vec_cap=vec_cap,
-                                    dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level
+                                    dbg=False, dbg_timing=False, dbg_level="WARNING"
                                 )
 
                             for tid in tasks_used:
@@ -712,7 +712,7 @@ def run_training():
                                 ros_minus_by_tid = _recollect_batch_for_sign(
                                     policy_net, per_task_tensors, tasks_used, device,
                                     seed_base=seed_for_pair, vec_cap=vec_cap,
-                                    dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level
+                                    dbg=False, dbg_timing=False, dbg_level="WARNING"
                                 )
 
                             for tid in tasks_used:
