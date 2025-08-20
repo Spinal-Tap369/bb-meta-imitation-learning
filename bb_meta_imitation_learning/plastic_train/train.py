@@ -1,7 +1,5 @@
 # plastic_train/train.py
 
-# plastic_train/train.py
-
 import os
 import sys
 import json
@@ -212,8 +210,8 @@ def run_training():
 
     args = parse_args()
 
-    # Choose log level: explicit > (debug ? DEBUG : INFO)
-    chosen_level = (args.log_level or ("DEBUG" if args.debug else "INFO")).upper()
+    # Prefer explicit --log_level; else --debug_level; else DEBUG if --debug else INFO.
+    chosen_level = (args.log_level or args.debug_level or ("DEBUG" if args.debug else "INFO")).upper()
     _setup_logging(log_file=args.log_file, level=chosen_level)
 
     # Debug flags (still control *what* we log; level controls verbosity)
@@ -395,6 +393,8 @@ def run_training():
         pbar = tqdm(range(num_batches), desc=f"[Epoch {epoch:02d}] train", leave=False, disable=getattr(args, "no_tqdm", False))
         for b in pbar:
             is_verbose_batch = debug and ((b % max(1, debug_every_batches)) == 0)
+            # Only show heavy per-task chatter at DEBUG
+            is_task_verbose = is_verbose_batch and (debug_level == "DEBUG")
 
             start = b * args.batch_size
             end = min(len(train_tasks), (b + 1) * args.batch_size)
@@ -413,7 +413,7 @@ def run_training():
                 if tid not in explore_cache or explore_cache[tid].reuse_count >= args.explore_reuse_M:
                     need_collect.append(task)
             _vec_cap = int(getattr(args, "num_envs", 8))
-            if is_verbose_batch:
+            if is_task_verbose:
                 logger.info("[COLLECT] need_collect=%d vec_cap=%d", len(need_collect), _vec_cap)
 
             for off in range(0, len(need_collect), max(1, _vec_cap)):
@@ -422,11 +422,11 @@ def run_training():
                 ro_list = collect_explore_vec(
                     policy_net, cfgs, device, max_steps=250,
                     seed_base=args.seed + 100000 * epoch + 1000 * b + off,
-                    dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level
+                    dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
                 )
                 for ttask, ro in zip(slice_tasks, ro_list):
                     explore_cache[ttask["task_id"]] = ro
-                    if is_verbose_batch and debug_shapes:
+                    if is_task_verbose and debug_shapes:
                         logger.debug("[COLLECT] tid=%s Tx=%d obs6=%s actions=%s rewards=%s",
                                      ttask["task_id"], ro.obs6.shape[0], _shape_str(ro.obs6),
                                      _shape_str(ro.actions), _shape_str(ro.rewards))
@@ -440,9 +440,11 @@ def run_training():
                 cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
                 ro = explore_cache.get(tid, None)
                 if ro is None:
-                    ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
-                                             seed_base=args.seed + 424242,
-                                             dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
+                    ro = collect_explore_vec(
+                        policy_net, [cfg], device, max_steps=250,
+                        seed_base=args.seed + 424242,
+                        dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
+                    ).pop()
                     explore_cache[tid] = ro
 
                 exp_six_dev  = ro.obs6.to(device, non_blocking=True)
@@ -456,19 +458,22 @@ def run_training():
                     logits_now_tmp, _ = policy_net(exp_six_dev.unsqueeze(0))
                     logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
                     kl_val = mean_kl_logits(logits_now_tmp, beh_logits_x).item()
-                if is_verbose_batch:
+                if is_task_verbose:
                     logger.info("[KL] tid=%s mean_kl=%.4f thr=%.4f", tid, kl_val, args.kl_refresh_threshold)
                 if kl_val > args.kl_refresh_threshold:
-                    ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
-                                             seed_base=args.seed + 999999,
-                                             dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
+                    ro = collect_explore_vec(
+                        policy_net, [cfg], device, max_steps=250,
+                        seed_base=args.seed + 999999,
+                        dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
+                    ).pop()
                     explore_cache[tid] = ro
                     exp_six_dev  = ro.obs6.to(device, non_blocking=True)
                     actions_x    = ro.actions.to(device, non_blocking=True)
                     rewards_x    = ro.rewards.to(device, non_blocking=True)
                     beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
                     Tx = exp_six_dev.shape[0]
-                    logger.info("[KL][REFRESH] tid=%s new_Tx=%d", tid, Tx)
+                    if is_task_verbose:
+                        logger.info("[KL][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
                 # ESS guard (optional)
                 if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
@@ -479,20 +484,23 @@ def run_training():
                         lp_beh = torch.log_softmax(beh_logits_x, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
                         rhos = torch.exp(lp_cur - lp_beh)
                         ess_ratio = ess_ratio_from_rhos(rhos).item()
-                    if is_verbose_batch:
+                    if is_task_verbose:
                         logger.info("[ESS] tid=%s Tx=%d ess_ratio=%.3f thr=%.3f reuse_count=%d",
                                     tid, Tx, ess_ratio, args.ess_refresh_ratio, ro.reuse_count)
                     if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio < args.ess_refresh_ratio:
-                        ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
-                                                 seed_base=args.seed + 31337,
-                                                 dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
+                        ro = collect_explore_vec(
+                            policy_net, [cfg], device, max_steps=250,
+                            seed_base=args.seed + 31337,
+                            dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
+                        ).pop()
                         explore_cache[tid] = ro
                         exp_six_dev  = ro.obs6.to(device, non_blocking=True)
                         actions_x    = ro.actions.to(device, non_blocking=True)
                         rewards_x    = ro.rewards.to(device, non_blocking=True)
                         beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
                         Tx = exp_six_dev.shape[0]
-                        logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
+                        if is_task_verbose:
+                            logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
                 # Build batched BC tensors from ALL demos (once)
                 prev_action_start = float(actions_x[-1].item()) if Tx > 0 else 0.0
@@ -531,7 +539,7 @@ def run_training():
                 batch_obs = torch.stack(pad_obs, dim=0)  # (B_d, T_max, 6,H,W)
                 batch_lab = torch.stack(pad_lab, dim=0)  # (B_d, T_max)
 
-                if is_verbose_batch and debug_shapes:
+                if is_task_verbose and debug_shapes:
                     logger.info("[BC][BUILD] tid=%s B_d=%d T_max=%d obs=%s lab=%s",
                                 tid, B_d, T_max, _shape_str(batch_obs), _shape_str(batch_lab))
 
@@ -553,7 +561,7 @@ def run_training():
             if len(tasks_used) == 0:
                 continue
 
-            if is_verbose_batch and debug_mem:
+            if is_task_verbose and debug_mem:
                 logger.info("[MEM][PRE-K] %s", _cuda_mem("pre-k", device))
 
             # -------- Critic auxiliary regression (optional) --------
@@ -583,7 +591,7 @@ def run_training():
                         vloss.backward()
                         torch.nn.utils.clip_grad_norm_(critic_params, 1.0)
                         opt_critic.step()
-                        if is_verbose_batch:
+                        if is_task_verbose:
                             logger.info("[CRITIC][AUX] step=%d/%d vloss=%.4f", s+1, args.critic_aux_steps, float(vloss.detach().cpu()))
 
             # =========================
@@ -635,7 +643,7 @@ def run_training():
 
                     # Prepare ES named params & grads
                     named_params = select_es_named_params(policy_net, getattr(args, "es_scope", "policy"))
-                    if is_verbose_batch:
+                    if is_task_verbose:
                         logger.info("[ES] scope=%s popsize=%d sigma=%.4f params=%d",
                                     getattr(args, "es_scope", "policy"),
                                     int(getattr(args, "es_popsize", 8)),
@@ -661,7 +669,7 @@ def run_training():
                                 ros_plus_by_tid = _recollect_batch_for_sign(
                                     policy_net, per_task_tensors, tasks_used, device,
                                     seed_base=seed_for_pair, vec_cap=vec_cap,
-                                    dbg=False, dbg_timing=False, dbg_level="WARNING"
+                                    dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
                                 )
 
                             for tid in tasks_used:
@@ -712,7 +720,7 @@ def run_training():
                                 ros_minus_by_tid = _recollect_batch_for_sign(
                                     policy_net, per_task_tensors, tasks_used, device,
                                     seed_base=seed_for_pair, vec_cap=vec_cap,
-                                    dbg=False, dbg_timing=False, dbg_level="WARNING"
+                                    dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
                                 )
 
                             for tid in tasks_used:
@@ -784,7 +792,7 @@ def run_training():
                             torch.cuda.empty_cache()
                             updates_since_free = 0
 
-                    if log_every_step or is_verbose_batch:
+                    if log_every_step or is_task_verbose:
                         msg = f"[ES STEP {step_idx+1}/{args.nbc}] bc(avg)={running_bc/max(1,count_updates):.4f}"
                         if debug_mem:
                             msg += " | " + _cuda_mem("post-es", device)
@@ -808,7 +816,7 @@ def run_training():
                     # (optional) truncate explore window for speed
                     if args.adapt_trunc_T is not None and isinstance(args.adapt_trunc_T, int) and exp.shape[0] > args.adapt_trunc_T:
                         exp = exp[-args.adapt_trunc_T:]; acts = acts[-args.adapt_trunc_T:]; rews = rews[-args.adapt_trunc_T:]; beh  = beh[-args.adapt_trunc_T:]
-                    if is_verbose_batch and debug_shapes and idx_task < debug_tasks_per_batch and step_idx == 0:
+                    if is_task_verbose and debug_shapes and idx_task < debug_tasks_per_batch and step_idx == 0:
                         logger.debug("[PLASTIC][TRUNC] tid=%s Tx_used=%d", tid, exp.shape[0])
 
                     # ---- pass 0: BC at θ (no plastic) for Δ gate ----
@@ -858,7 +866,7 @@ def run_training():
                             rho = torch.clamp(rho, max=args.is_clip_rho)
                         m_t = m_t * rho.detach()
 
-                    if is_verbose_batch and debug_inner_per_task and idx_task < debug_tasks_per_batch:
+                    if is_task_verbose and debug_inner_per_task and idx_task < debug_tasks_per_batch:
                         logger.debug("[PLASTIC][MOD] tid=%s mean=%.3f std=%.3f min=%.3f max=%.3f",
                                      tid, float(m_t.mean()), float(m_t.std()), float(m_t.min()), float(m_t.max()))
 
@@ -929,8 +937,8 @@ def run_training():
                         torch.cuda.empty_cache()
                         updates_since_free = 0
 
-                # <-- always log step if --log_every_step, else only when batch is verbose
-                if log_every_step or is_verbose_batch:
+                # Only spam step logs at DEBUG (unless --log_every_step is set)
+                if log_every_step or is_task_verbose:
                     msg = f"[STEP {step_idx+1}/{args.nbc}] avg_bc={float(total_bc):.4f} inrl@theta(avg)={running_inrl/max(1,count_updates):.4f}"
                     if debug_mem:
                         msg += " | " + _cuda_mem("post-step", device)
