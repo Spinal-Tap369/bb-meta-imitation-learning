@@ -1,5 +1,3 @@
-# plastic_train/config.py
-
 import argparse
 
 def parse_args():
@@ -16,6 +14,16 @@ def parse_args():
     p.add_argument("--save_path", type=str, default="bc_meta_ckpts")
     p.add_argument("--load_path", type=str, default="bc_meta_ckpts_load")
 
+    # Logging
+    p.add_argument("--log_file", type=str, default="train_debug.txt",
+                   help="Path to a txt log file (all logs will also be appended here)")
+    p.add_argument("--log_level", type=str, default=None,
+                   help="Override root log level (DEBUG/INFO/WARNING). If not set: DEBUG if --debug else INFO.")
+    p.add_argument("--log_every_step", action="store_true",
+                   help="Log [STEP ...] and [ES STEP ...] lines for every step regardless of debug_every_batches.")
+    p.add_argument("--no_tqdm", action="store_true",
+                   help="Disable tqdm progress bar (cleaner logs when piping to files).")
+
     # Training
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=16)
@@ -26,13 +34,13 @@ def parse_args():
     p.add_argument("--adapt_trunc_T", type=int, default=250,
                    help="Truncate explore traj to last T steps before plastic adaptation")
 
-    # Loss / regularization
+    # Loss / regularization (note: outer loss is pure BC; Δ can reweight per-task losses)
     p.add_argument("--label_smoothing", type=float, default=0.0,
                    help="Label smoothing for exploitation BC")
-    p.add_argument("--outer_pg_coef", type=float, default=0.0,
-                   help="Δ-gated outer PG term weight (0 disables)")
     p.add_argument("--delta_gate_relu", action="store_true",
-                   help="Use ReLU on Δ gate (only reward positive adaptation)")
+                   help="Use ReLU on standardized Δ if used for reweighting")
+    p.add_argument("--delta_weight_mode", type=str, default="none", choices=["none", "std", "relu"],
+                   help="If not 'none', weight per-task BC by standardized Δ (or its ReLU)")
 
     # RL / returns
     p.add_argument("--gamma", type=float, default=0.99)
@@ -45,17 +53,19 @@ def parse_args():
     p.add_argument("--explore_reuse_M", type=int, default=1,
                    help="Reuse count for the same phase-1 rollout (1=no reuse)")
     p.add_argument("--is_clip_rho", type=float, default=2.0,
-                   help="IS ρ clip (cap importance weights) for monitor PG")
+                   help="IS ρ clip (cap importance weights)")
     p.add_argument("--kl_refresh_threshold", type=float, default=0.02,
                    help="Recollect if KL(target||behavior) exceeds this")
     p.add_argument("--ess_refresh_ratio", type=float, default=0.3,
                    help="Recollect if ESS/T drops below this")
+    p.add_argument("--inner_use_is_mod", action="store_true",
+                   help="When reusing inner rollouts, multiply plastic modulators by IS weights ρ_t.")
 
     # Encoder schedule
     p.add_argument("--freeze_encoder_warmup_epochs", type=int, default=2)
     p.add_argument("--encoder_lr_mult", type=float, default=0.1)
 
-    # Critic (value function) training — optional & separate
+    # Critic (value function) training — optional & separate (for monitoring/value head aux only)
     p.add_argument("--critic_aux_steps", type=int, default=0,
                    help="Auxiliary critic-only regression steps per batch")
     p.add_argument("--critic_lr_mult", type=float, default=1.0)
@@ -77,17 +87,6 @@ def parse_args():
     p.add_argument("--plastic_learn_eta", action="store_true")
     p.add_argument("--plastic_clip_mod", type=float, default=2.0)
 
-    # Data augmentation (optional)
-    p.add_argument("--use_aug", action="store_true")
-    p.add_argument("--aug_prob", type=float, default=0.5)
-    p.add_argument("--aug_brightness_range", type=float, nargs=2, default=(0.9, 1.1))
-    p.add_argument("--aug_contrast_range",  type=float, nargs=2, default=(0.9, 1.1))
-    p.add_argument("--aug_noise_std", type=float, default=0.02)
-    p.add_argument("--aug_jitter_max", type=int, default=2)
-    p.add_argument("--aug_bc_prob", type=float, default=0.5)
-    p.add_argument("--aug_noise_prob", type=float, default=0.25)
-    p.add_argument("--aug_jitter_prob", type=float, default=0.25)
-
     # ----- ES / SPSA (black-box meta) -----
     p.add_argument("--es_enabled", action="store_true",
                    help="Use black-box ES/SPSA for the outer update instead of backprop")
@@ -101,6 +100,18 @@ def parse_args():
                    help="Subset of model params to optimize with ES")
     p.add_argument("--es_clip_grad", type=float, default=1.0,
                    help="Clip norm for ES gradient before optimizer.step()")
+    p.add_argument("--es_recollect_inner", action="store_true",
+                   help="For each perturbation (±), recollect inner rollout under the perturbed policy.")
+    p.add_argument("--es_common_seed", action="store_true",
+                   help="Use common random numbers (same env seed) for +/− reco.")
+    p.add_argument("--es_use_is_inner", action="store_true",
+                   help="If not recollecting, reuse cached trajectories but apply IS within inner for f±.")
+    p.add_argument("--es_ess_min_ratio", type=float, default=0.1,
+                   help="If per-perturbation ESS/T drops below this, drop task from fitness for that perturbation.")
+    p.add_argument("--es_ranknorm", action="store_true",
+                   help="Rank-normalize task fitness before averaging within a perturbation.")
+    p.add_argument("--es_fitness_baseline", action="store_true",
+                   help="Subtract unperturbed f(θ) from f± before gradient estimate.")
 
     # Debug (optional)
     p.add_argument("--debug", action="store_true")
@@ -111,5 +122,11 @@ def parse_args():
     p.add_argument("--debug_mem", action="store_true")
     p.add_argument("--debug_timing", action="store_true")
     p.add_argument("--debug_shapes", action="store_true")
+
+    # ----- ES inner PG (ephemeral fast-weights) -----
+    p.add_argument("--es_inner_pg_alpha", type=float, default=0.0, help="If > 0: use a one-step REINFORCE inner update (lr=alpha) inside ES fitness.")
+    p.add_argument("--es_inner_pg_scope", type=str, default="head", choices=["head", "policy"], help="Which params to update in the inner PG step.")
+    p.add_argument("--es_inner_pg_use_is", action="store_true", help="Apply IS weights rho_t in the inner PG loss when reusing behavior data.")
+
 
     return p.parse_args()

@@ -1,0 +1,128 @@
+2025-08-20 15:27:48,190 [INFO] bb_meta_imitation_learning.plastic_train.train: [SETUP] seed=42
+2025-08-20 15:27:48,191 [INFO] bb_meta_imitation_learning.plastic_train.train: [DEVICE] device=cpu amp=False CPU
+2025-08-20 15:27:48,407 [INFO] bb_meta_imitation_learning.plastic_train.train: [DATA] loaded train_trials=bb_meta_imitation_learning\mazes_data_try\train_trials.json num_tasks=1065
+2025-08-20 15:27:48,544 [INFO] bb_meta_imitation_learning.plastic_train.train: [DATA] demo_root=bb_meta_imitation_learning\mazes_data_try\train_demos tasks_with_demos=851
+2025-08-20 15:27:48,559 [INFO] bb_meta_imitation_learning.plastic_train.train: [SPLIT] train=841 val=10 (val_size=10)
+2025-08-20 15:27:49,482 [INFO] bb_meta_imitation_learning.plastic_train.train: [MODEL] built model params total=1976116 trainable=1976116
+2025-08-20 15:27:49,848 [INFO] bb_meta_imitation_learning.plastic_train.remap: [INIT][REMAPPER] mapped 167/168 checkpoint tensors into current model
+2025-08-20 15:27:49,923 [INFO] bb_meta_imitation_learning.plastic_train.train: [INIT] loaded BC init (after remap) from E:\Py_Files\bb-meta-imitation-learning\bb_meta_imitation_learning\bc_pretrainer_ckpts\bc_best.pth (matched=167 missing=3 unexpected=0)
+2025-08-20 15:27:49,923 [INFO] bb_meta_imitation_learning.plastic_train.train: [INIT] plastic head fast weights (H, _eta_const/param) missing in ckpt is expected.
+2025-08-20 15:27:49,924 [INFO] bb_meta_imitation_learning.plastic_train.train: [ENCODER] Using submodule 'combined_encoder'.
+2025-08-20 15:28:12,783 [INFO] bb_meta_imitation_learning.plastic_train.train: [ENCODER] Frozen for first 2 epoch(s).
+2025-08-20 15:28:12,784 [INFO] bb_meta_imitation_learning.plastic_train.train: [CRITIC] Critic head params=475009 (lr x1.00)
+2025-08-20 15:28:12,785 [INFO] bb_meta_imitation_learning.plastic_train.model: [CHECKPOINT] none found, starting from scratch
+2025-08-20 15:28:12,785 [INFO] bb_meta_imitation_learning.plastic_train.train: [RESUME] from epoch 1
+2025-08-20 15:28:18,684 [INFO] bb_meta_imitation_learning.plastic_train.train: [SHAPES] SEQ_LEN=500
+2025-08-20 15:28:18,684 [INFO] bb_meta_imitation_learning.plastic_train.train: ========== [EPOCH 01/01] ==========
+2025-08-20 15:28:18,686 [INFO] bb_meta_imitation_learning.plastic_train.train: [TRAIN] num_batches=281 batch_size=3
+2025-08-20 15:28:18,692 [INFO] bb_meta_imitation_learning.plastic_train.train: [BATCH 1/281] tasks=[126, 221, 665]
+2025-08-20 15:28:18,692 [INFO] bb_meta_imitation_learning.plastic_train.train: [MEM][BATCH-START] CPU
+2025-08-20 15:28:18,693 [INFO] bb_meta_imitation_learning.plastic_train.train: [COLLECT] need_collect=3 vec_cap=1
+2025-08-20 15:28:22,699 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 15:28:43,499 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=20.80s env=0.65s net=16.81s throughput=12.0 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 15:28:44,767 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=126 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 15:28:49,468 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 15:29:04,966 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=15.50s env=0.73s net=14.38s throughput=16.1 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 15:29:05,559 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=221 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 15:29:09,188 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 15:29:24,121 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=14.93s env=0.41s net=14.15s throughput=16.7 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 15:29:24,575 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=665 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 15:29:24,936 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=126 mean_kl=0.0000 thr=0.0100
+2025-08-20 15:29:25,381 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=126 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 15:29:26,361 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=126 B_d=3 T_max=350 obs=(3, 350, 6, 40, 60) float32 lab=(3, 350) int64
+2025-08-20 15:29:26,464 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=221 mean_kl=0.0000 thr=0.0100
+2025-08-20 15:29:26,561 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=221 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 15:29:26,836 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=221 B_d=3 T_max=350 obs=(3, 350, 6, 40, 60) float32 lab=(3, 350) int64
+2025-08-20 15:29:26,917 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=665 mean_kl=0.0000 thr=0.0100
+2025-08-20 15:29:27,013 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=665 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 15:29:27,404 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=665 B_d=3 T_max=359 obs=(3, 359, 6, 40, 60) float32 lab=(3, 359) int64
+2025-08-20 15:29:27,404 [INFO] bb_meta_imitation_learning.plastic_train.train: [MEM][PRE-K] CPU
+2025-08-20 15:29:28,837 [INFO] bb_meta_imitation_learning.plastic_train.train: [ES] scope=policy popsize=8 sigma=0.0200 params=82
+2025-08-20 15:39:42,042 [INFO] bb_meta_imitation_learning.plastic_train.train: [ES STEP 1/1] bc(avg)=1.7812 | CPU
+2025-08-20 15:39:42,048 [INFO] bb_meta_imitation_learning.plastic_train.train: [BATCH 2/281] tasks=[461, 134, 311]
+2025-08-20 15:39:42,048 [INFO] bb_meta_imitation_learning.plastic_train.train: [MEM][BATCH-START] CPU
+2025-08-20 15:39:42,048 [INFO] bb_meta_imitation_learning.plastic_train.train: [COLLECT] need_collect=3 vec_cap=1
+2025-08-20 15:39:45,414 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 15:39:59,806 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=14.39s env=0.39s net=13.66s throughput=17.4 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 15:40:00,244 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=461 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 15:40:03,569 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 15:40:17,838 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=14.27s env=0.37s net=13.55s throughput=17.5 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 15:40:18,309 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=134 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 15:40:21,625 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 15:40:35,970 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=14.35s env=0.39s net=13.61s throughput=17.4 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 15:40:36,402 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=311 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 15:40:36,476 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=461 mean_kl=0.0000 thr=0.0100
+2025-08-20 15:40:36,547 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=461 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 15:40:37,342 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=461 B_d=3 T_max=346 obs=(3, 346, 6, 40, 60) float32 lab=(3, 346) int64
+2025-08-20 15:40:37,416 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=134 mean_kl=-0.0000 thr=0.0100
+2025-08-20 15:40:37,488 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=134 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 15:40:37,808 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=134 B_d=3 T_max=322 obs=(3, 322, 6, 40, 60) float32 lab=(3, 322) int64
+2025-08-20 15:40:37,881 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=311 mean_kl=0.0000 thr=0.0100
+2025-08-20 15:40:37,961 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=311 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 15:40:38,213 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=311 B_d=3 T_max=333 obs=(3, 333, 6, 40, 60) float32 lab=(3, 333) int64
+2025-08-20 15:40:38,214 [INFO] bb_meta_imitation_learning.plastic_train.train: [MEM][PRE-K] CPU
+2025-08-20 15:40:39,045 [INFO] bb_meta_imitation_learning.plastic_train.train: [ES] scope=policy popsize=8 sigma=0.0200 params=82
+2025-08-20 15:49:35,527 [INFO] bb_meta_imitation_learning.plastic_train.train: [SETUP] seed=42
+2025-08-20 15:49:35,529 [INFO] bb_meta_imitation_learning.plastic_train.train: [DEVICE] device=cpu amp=False CPU
+2025-08-20 15:49:35,675 [INFO] bb_meta_imitation_learning.plastic_train.train: [DATA] loaded train_trials=bb_meta_imitation_learning\mazes_data_try\train_trials.json num_tasks=1065
+2025-08-20 15:49:35,709 [INFO] bb_meta_imitation_learning.plastic_train.train: [DATA] demo_root=bb_meta_imitation_learning\mazes_data_try\train_demos tasks_with_demos=851
+2025-08-20 15:49:35,723 [INFO] bb_meta_imitation_learning.plastic_train.train: [SPLIT] train=841 val=10 (val_size=10)
+2025-08-20 15:49:35,975 [INFO] bb_meta_imitation_learning.plastic_train.train: [MODEL] built model params total=1976116 trainable=1976116
+2025-08-20 15:49:36,355 [INFO] bb_meta_imitation_learning.plastic_train.remap: [INIT][REMAPPER] mapped 167/168 checkpoint tensors into current model
+2025-08-20 15:49:36,372 [INFO] bb_meta_imitation_learning.plastic_train.train: [INIT] loaded BC init (after remap) from E:\Py_Files\bb-meta-imitation-learning\bb_meta_imitation_learning\bc_pretrainer_ckpts\bc_best.pth (matched=167 missing=3 unexpected=0)
+2025-08-20 15:49:36,373 [INFO] bb_meta_imitation_learning.plastic_train.train: [INIT] plastic head fast weights (H, _eta_const/param) missing in ckpt is expected.
+2025-08-20 15:49:36,374 [INFO] bb_meta_imitation_learning.plastic_train.train: [ENCODER] Using submodule 'combined_encoder'.
+2025-08-20 15:49:56,103 [INFO] bb_meta_imitation_learning.plastic_train.train: [ENCODER] Frozen for first 2 epoch(s).
+2025-08-20 15:49:56,104 [INFO] bb_meta_imitation_learning.plastic_train.train: [CRITIC] Critic head params=475009 (lr x1.00)
+2025-08-20 15:49:56,105 [INFO] bb_meta_imitation_learning.plastic_train.model: [CHECKPOINT] none found, starting from scratch
+2025-08-20 15:49:56,105 [INFO] bb_meta_imitation_learning.plastic_train.train: [RESUME] from epoch 1
+2025-08-20 15:49:56,689 [INFO] bb_meta_imitation_learning.plastic_train.train: [SHAPES] SEQ_LEN=500
+2025-08-20 15:49:56,689 [INFO] bb_meta_imitation_learning.plastic_train.train: ========== [EPOCH 01/01] ==========
+2025-08-20 15:49:56,690 [INFO] bb_meta_imitation_learning.plastic_train.train: [TRAIN] num_batches=281 batch_size=3
+2025-08-20 15:49:56,695 [INFO] bb_meta_imitation_learning.plastic_train.train: [BATCH 1/281] tasks=[126, 221, 665]
+2025-08-20 15:49:56,695 [INFO] bb_meta_imitation_learning.plastic_train.train: [MEM][BATCH-START] CPU
+2025-08-20 15:49:56,695 [INFO] bb_meta_imitation_learning.plastic_train.train: [COLLECT] need_collect=3 vec_cap=1
+2025-08-20 15:50:00,813 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 15:50:16,158 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=15.34s env=0.39s net=14.52s throughput=16.3 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 15:50:16,589 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=126 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 15:50:19,902 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 15:50:34,748 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=14.85s env=0.44s net=14.05s throughput=16.8 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 15:50:35,213 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=221 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 15:50:38,702 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 15:50:54,776 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=16.07s env=0.41s net=15.29s throughput=15.6 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 15:50:55,230 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=665 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 15:50:55,331 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=126 mean_kl=0.0000 thr=0.0100
+2025-08-20 15:50:55,405 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=126 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 15:50:55,679 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=126 B_d=3 T_max=350 obs=(3, 350, 6, 40, 60) float32 lab=(3, 350) int64
+2025-08-20 15:50:55,743 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=221 mean_kl=0.0000 thr=0.0100
+2025-08-20 15:50:55,812 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=221 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 15:50:56,097 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=221 B_d=3 T_max=350 obs=(3, 350, 6, 40, 60) float32 lab=(3, 350) int64
+2025-08-20 15:50:56,194 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=665 mean_kl=0.0000 thr=0.0100
+2025-08-20 15:50:56,314 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=665 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 15:50:56,542 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=665 B_d=3 T_max=359 obs=(3, 359, 6, 40, 60) float32 lab=(3, 359) int64
+2025-08-20 15:50:56,542 [INFO] bb_meta_imitation_learning.plastic_train.train: [MEM][PRE-K] CPU
+2025-08-20 15:50:57,896 [INFO] bb_meta_imitation_learning.plastic_train.train: [ES] scope=policy popsize=8 sigma=0.0200 params=82
+2025-08-20 16:01:14,022 [INFO] bb_meta_imitation_learning.plastic_train.train: [ES STEP 1/1] bc(avg)=1.8116 | CPU
+2025-08-20 16:01:14,030 [INFO] bb_meta_imitation_learning.plastic_train.train: [BATCH 2/281] tasks=[461, 134, 311]
+2025-08-20 16:01:14,030 [INFO] bb_meta_imitation_learning.plastic_train.train: [MEM][BATCH-START] CPU
+2025-08-20 16:01:14,030 [INFO] bb_meta_imitation_learning.plastic_train.train: [COLLECT] need_collect=3 vec_cap=1
+2025-08-20 16:01:17,460 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 16:01:32,860 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=15.40s env=0.39s net=14.64s throughput=16.2 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 16:01:33,314 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=461 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 16:01:36,902 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 16:01:54,016 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=17.11s env=0.44s net=16.33s throughput=14.6 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 16:01:54,578 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=134 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 16:01:58,193 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC] created AsyncVectorEnv async=True num_envs=1
+2025-08-20 16:02:15,231 [INFO] bb_meta_imitation_learning.plastic_train.explore: [VEC][SUMMARY] envs=1 total_steps=250 elapsed=17.04s env=0.42s net=16.25s throughput=14.7 steps/s fwd_calls=250 batched_calls=0 (0.0%) avg_fwd_batch=1.00
+2025-08-20 16:02:15,756 [DEBUG] bb_meta_imitation_learning.plastic_train.train: [COLLECT] tid=311 Tx=250 obs6=(250, 6, 40, 60) float32 actions=(250,) int64 rewards=(250,) float32
+2025-08-20 16:02:15,846 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=461 mean_kl=-0.0000 thr=0.0100
+2025-08-20 16:02:15,926 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=461 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 16:02:16,146 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=461 B_d=3 T_max=346 obs=(3, 346, 6, 40, 60) float32 lab=(3, 346) int64
+2025-08-20 16:02:16,251 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=134 mean_kl=-0.0000 thr=0.0100
+2025-08-20 16:02:16,347 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=134 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 16:02:16,578 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=134 B_d=3 T_max=322 obs=(3, 322, 6, 40, 60) float32 lab=(3, 322) int64
+2025-08-20 16:02:16,682 [INFO] bb_meta_imitation_learning.plastic_train.train: [KL] tid=311 mean_kl=0.0000 thr=0.0100
+2025-08-20 16:02:16,764 [INFO] bb_meta_imitation_learning.plastic_train.train: [ESS] tid=311 Tx=250 ess_ratio=1.000 thr=0.300 reuse_count=0
+2025-08-20 16:02:16,974 [INFO] bb_meta_imitation_learning.plastic_train.train: [BC][BUILD] tid=311 B_d=3 T_max=333 obs=(3, 333, 6, 40, 60) float32 lab=(3, 333) int64
+2025-08-20 16:02:16,974 [INFO] bb_meta_imitation_learning.plastic_train.train: [MEM][PRE-K] CPU
+2025-08-20 16:02:17,767 [INFO] bb_meta_imitation_learning.plastic_train.train: [ES] scope=policy popsize=8 sigma=0.0200 params=82

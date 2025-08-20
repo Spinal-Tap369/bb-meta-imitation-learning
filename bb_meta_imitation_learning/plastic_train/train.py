@@ -6,7 +6,7 @@ import json
 import math
 import random
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -37,27 +37,40 @@ from .explore import ExploreRollout, collect_explore_vec, make_base_env
 from .rl_loss import mean_kl_logits, ess_ratio_from_rhos, discounted_returns
 
 # ---- ES helpers ----
-from .es import select_es_named_params, sample_eps, PerturbContext, meta_objective_from_rollout
+from .es import (
+    select_es_named_params,
+    sample_eps,
+    PerturbContext,
+    meta_objective_from_rollout,
+    meta_objective_with_inner_pg,  # <-- new helper import
+)
 
 logger = logging.getLogger(__name__)
 
 # ---------- logging setup ----------
-def _setup_logging():
+def _setup_logging(log_file: Optional[str], level: str):
+    """Set up root logger to both stdout and an optional file."""
     root = logging.getLogger()
-    if not root.handlers:
-        h = logging.StreamHandler(sys.stdout)
-        h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-        root.addHandler(h)
-    root.setLevel(logging.INFO)
-    logging.getLogger(__name__).setLevel(logging.INFO)
+    # Clear preexisting handlers to avoid duplicates (e.g., in notebooks)
+    for h in list(root.handlers):
+        root.removeHandler(h)
 
-def _maybe_set_debug_level(debug: bool, level: str):
-    if not debug:
-        return
-    level = level.upper().strip()
-    lvl = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING}.get(level, logging.INFO)
-    logging.getLogger().setLevel(lvl)
+    fmt_console = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt_console)
+    root.addHandler(console)
+
+    if log_file:
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        fmt_file = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        fileh = logging.FileHandler(log_file, mode="a")
+        fileh.setFormatter(fmt_file)
+        root.addHandler(fileh)
+
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    root.setLevel(lvl)
     logging.getLogger(__name__).setLevel(lvl)
+
 
 def _cuda_mem(prefix: str, device):
     if device.type != "cuda":
@@ -66,25 +79,18 @@ def _cuda_mem(prefix: str, device):
     r = torch.cuda.memory_reserved() / (1024**2)
     return f"{prefix} mem: alloc={a:.1f}MB reserved={r:.1f}MB"
 
+
 def _shape_str(t):
     if isinstance(t, torch.Tensor):
         return f"{tuple(t.shape)} {str(t.dtype).replace('torch.','')}"
     return str(type(t))
+
 
 def _count_params(mod: nn.Module):
     tot = sum(p.numel() for p in mod.parameters())
     train = sum(p.numel() for p in mod.parameters() if p.requires_grad)
     return tot, train
 
-def _timer():
-    t0 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start, end = t0
-    def _fn():
-        end.record()
-        torch.cuda.synchronize()
-        return start.elapsed_time(end) / 1000.0
-    start.record()
-    return _fn
 
 # ---------- optimizer helpers ----------
 def _find_encoder_module(net: torch.nn.Module):
@@ -100,6 +106,7 @@ def _find_encoder_module(net: torch.nn.Module):
             return mod, name
     return None, None
 
+
 def _critic_param_names(net: nn.Module):
     names = []
     for n, _ in net.named_parameters():
@@ -107,6 +114,7 @@ def _critic_param_names(net: nn.Module):
         if ("value" in ln) or ("critic" in ln) or ("vf" in ln):
             names.append(n)
     return set(names)
+
 
 # ---------- small helpers used in both paths ----------
 @torch.no_grad()
@@ -121,12 +129,13 @@ def _compute_bc_theta(policy_net: nn.Module, batch_obs: torch.Tensor, batch_lab:
     ce = torch.nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
     return ce(logits_bc_theta.reshape(-1, logits_bc_theta.size(-1)), batch_lab.reshape(-1)).detach()
 
+
 @torch.no_grad()
 def _outer_pg_term(policy_net: nn.Module,
                    exp: torch.Tensor, acts: torch.Tensor, beh_logits: torch.Tensor,
                    rews: torch.Tensor, args) -> torch.Tensor:
     """
-    Compute the small outer PG monitor term at θ (or perturbed θ), with IS clip.
+    Monitor-only: outer PG at θ with IS clip. Not used in loss.
     """
     if hasattr(policy_net, "reset_plastic"):
         policy_net.reset_plastic(batch_size=1, device=exp.device)
@@ -152,23 +161,27 @@ def _outer_pg_term(policy_net: nn.Module,
         rho = torch.clamp(rho, max=args.is_clip_rho)
     return ( - (rho * logp_cur * adv_norm).mean() ).detach()
 
+
 # ---------- training loop ----------
 def run_training():
     from .remap import remap_pretrained_state  # local import to keep module edges clean
 
     args = parse_args()
-    _setup_logging()
 
-    # Debug flags
+    # Choose log level: explicit > (debug ? DEBUG : INFO)
+    chosen_level = (args.log_level or ("DEBUG" if args.debug else "INFO")).upper()
+    _setup_logging(log_file=args.log_file, level=chosen_level)
+
+    # Debug flags (still control *what* we log; level controls verbosity)
     debug = bool(getattr(args, "debug", False))
     debug_level = str(getattr(args, "debug_level", "INFO")).upper()
     debug_every_batches = int(getattr(args, "debug_every_batches", 1))
     debug_tasks_per_batch = int(getattr(args, "debug_tasks_per_batch", 4))
     debug_inner_per_task = bool(getattr(args, "debug_inner_per_task", False))
-    debug_mem = bool(getattr(args, "debug_mem", True))
-    debug_timing = bool(getattr(args, "debug_timing", True))
-    debug_shapes = bool(getattr(args, "debug_shapes", True))
-    _maybe_set_debug_level(debug, debug_level)
+    debug_mem = bool(getattr(args, "debug_mem", False))
+    debug_timing = bool(getattr(args, "debug_timing", False))
+    debug_shapes = bool(getattr(args, "debug_shapes", False))
+    log_every_step = bool(getattr(args, "log_every_step", False))
 
     # Seeding
     random.seed(args.seed); np.random.seed(args.seed)
@@ -336,7 +349,7 @@ def run_training():
         running_inrl = 0.0
         count_updates = 0
 
-        pbar = tqdm(range(num_batches), desc=f"[Epoch {epoch:02d}] train", leave=False)
+        pbar = tqdm(range(num_batches), desc=f"[Epoch {epoch:02d}] train", leave=False, disable=getattr(args, "no_tqdm", False))
         for b in pbar:
             is_verbose_batch = debug and ((b % max(1, debug_every_batches)) == 0)
 
@@ -400,7 +413,7 @@ def run_training():
                     logits_now_tmp, _ = policy_net(exp_six_dev.unsqueeze(0))
                     logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
                     kl_val = mean_kl_logits(logits_now_tmp, beh_logits_x).item()
-                if is_verbose_batch and idx_task < debug_tasks_per_batch:
+                if is_verbose_batch:
                     logger.info("[KL] tid=%s mean_kl=%.4f thr=%.4f", tid, kl_val, args.kl_refresh_threshold)
                 if kl_val > args.kl_refresh_threshold:
                     ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
@@ -412,8 +425,7 @@ def run_training():
                     rewards_x    = ro.rewards.to(device, non_blocking=True)
                     beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
                     Tx = exp_six_dev.shape[0]
-                    if is_verbose_batch:
-                        logger.info("[KL][REFRESH] tid=%s new_Tx=%d", tid, Tx)
+                    logger.info("[KL][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
                 # ESS guard (optional)
                 if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
@@ -424,7 +436,7 @@ def run_training():
                         lp_beh = torch.log_softmax(beh_logits_x, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
                         rhos = torch.exp(lp_cur - lp_beh)
                         ess_ratio = ess_ratio_from_rhos(rhos).item()
-                    if is_verbose_batch and idx_task < debug_tasks_per_batch:
+                    if is_verbose_batch:
                         logger.info("[ESS] tid=%s Tx=%d ess_ratio=%.3f thr=%.3f reuse_count=%d",
                                     tid, Tx, ess_ratio, args.ess_refresh_ratio, ro.reuse_count)
                     if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio < args.ess_refresh_ratio:
@@ -437,8 +449,7 @@ def run_training():
                         rewards_x    = ro.rewards.to(device, non_blocking=True)
                         beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
                         Tx = exp_six_dev.shape[0]
-                        if is_verbose_batch and idx_task < debug_tasks_per_batch:
-                            logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
+                        logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
                 # Build batched BC tensors from ALL demos (once)
                 prev_action_start = float(actions_x[-1].item()) if Tx > 0 else 0.0
@@ -457,8 +468,7 @@ def run_training():
                     demo_lab_list.append(labels_cat)
 
                 if len(demo_obs_list) == 0:
-                    if is_verbose_batch and idx_task < debug_tasks_per_batch:
-                        logger.warning("[BC][SKIP] tid=%s no demos to supervise in this batch", tid)
+                    logger.warning("[BC][SKIP] tid=%s no demos to supervise in this batch", tid)
                     continue
 
                 B_d = len(demo_obs_list)
@@ -478,7 +488,7 @@ def run_training():
                 batch_obs = torch.stack(pad_obs, dim=0)  # (B_d, T_max, 6,H,W)
                 batch_lab = torch.stack(pad_lab, dim=0)  # (B_d, T_max)
 
-                if is_verbose_batch and idx_task < debug_tasks_per_batch and debug_shapes:
+                if is_verbose_batch and debug_shapes:
                     logger.info("[BC][BUILD] tid=%s B_d=%d T_max=%d obs=%s lab=%s",
                                 tid, B_d, T_max, _shape_str(batch_obs), _shape_str(batch_lab))
 
@@ -490,6 +500,7 @@ def run_training():
                     "rewards": rewards_x,
                     "beh_logits": beh_logits_x,
                     "ro": ro,
+                    "task_dict": task["task_dict"],
                 }
                 tasks_used.append(tid)
 
@@ -507,7 +518,7 @@ def run_training():
                 for s in range(args.critic_aux_steps):
                     opt_critic.zero_grad(set_to_none=True)
                     vlosses = []
-                    for idx_task, tid in enumerate(tasks_used):
+                    for tid in tasks_used:
                         tensors = per_task_tensors[tid]
                         exp = tensors["exp"]
                         rews = tensors["rewards"] * args.rew_scale
@@ -541,116 +552,179 @@ def run_training():
                 if getattr(args, "es_enabled", False):
                     optimizer.zero_grad(set_to_none=True)
 
-                    # Precompute BC@θ (no plastic) per task for Δ-gate
-                    bc_theta_map: Dict[int, torch.Tensor] = {}
-                    for idx_task, tid in enumerate(tasks_used):
-                        tensors = per_task_tensors[tid]
-                        bc_theta = _compute_bc_theta(policy_net, tensors["batch_obs"], tensors["batch_lab"], args)
-                        bc_theta_map[tid] = bc_theta
+                    # Config for inner PG vs plasticity-based inner
+                    use_pg_inner = (getattr(args, "es_inner_pg_alpha", 0.0) > 0.0)
+                    inner_use_is = (not getattr(args, "es_recollect_inner", False)) and bool(getattr(args, "es_inner_pg_use_is", False))
 
-                    # Also compute BC-after-adapt @θ for logging (not used in grad)
+                    # Compute f(θ) baseline (unperturbed after-adapt BC) for logging/baseline
                     with torch.no_grad():
                         bc_phi_base = []
-                        inrl_base = 0.0
                         for tid in tasks_used:
                             t = per_task_tensors[tid]
-                            # BC after inner adaptation (unperturbed)
-                            bc_phi = meta_objective_from_rollout(policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device)
-                            bc_phi_base.append(float(bc_phi.cpu()))
-                            # small monitor PG at θ
-                            if args.outer_pg_coef and args.outer_pg_coef > 0.0:
-                                rews = torch.clamp(t["rewards"] * args.rew_scale, -args.rew_clip, args.rew_clip)
-                                pg = _outer_pg_term(policy_net, t["exp"], t["actions"], t["beh_logits"], rews, args)
-                                inrl_base += float(pg.cpu())
+                            ro0 = t["ro"]
+                            if use_pg_inner:
+                                bc_phi0 = meta_objective_with_inner_pg(
+                                    policy_net,
+                                    ro0,
+                                    t["batch_obs"], t["batch_lab"],
+                                    args, device,
+                                    alpha=getattr(args, "es_inner_pg_alpha", 0.0),
+                                    scope=getattr(args, "es_inner_pg_scope", "head"),
+                                    use_is=inner_use_is,
+                                    is_clip_rho=getattr(args, "is_clip_rho", 0.0),
+                                    ess_min_ratio=(getattr(args, "es_ess_min_ratio", None) if not getattr(args, "es_recollect_inner", False) else None),
+                                )
+                            else:
+                                bc_phi0 = meta_objective_from_rollout(
+                                    policy_net,
+                                    ro0,
+                                    t["batch_obs"], t["batch_lab"],
+                                    args, device,
+                                    use_is_inner=(not getattr(args, "es_recollect_inner", False)) and bool(getattr(args, "es_use_is_inner", False)),
+                                    is_clip_rho=getattr(args, "is_clip_rho", 0.0),
+                                    ess_min_ratio=(getattr(args, "es_ess_min_ratio", None) if not getattr(args, "es_recollect_inner", False) else None),
+                                )
+                            bc_phi_base.append(float(bc_phi0.cpu()))
                         if bc_phi_base:
                             running_bc += float(np.mean(bc_phi_base))
-                            if args.outer_pg_coef and args.outer_pg_coef > 0.0:
-                                running_inrl += inrl_base / max(1, len(tasks_used))
                             count_updates += 1
+                    f_theta_baseline = float(np.mean(bc_phi_base)) if bc_phi_base else 0.0
 
                     # Prepare ES named params & grads
-                    named_params = select_es_named_params(policy_net, args.es_scope)
+                    named_params = select_es_named_params(policy_net, getattr(args, "es_scope", "policy"))
                     if is_verbose_batch:
                         logger.info("[ES] scope=%s popsize=%d sigma=%.4f params=%d",
-                                    args.es_scope, int(args.es_popsize), float(args.es_sigma), len(named_params))
+                                    getattr(args, "es_scope", "policy"),
+                                    int(getattr(args, "es_popsize", 8)),
+                                    float(getattr(args, "es_sigma", 0.02)),
+                                    len(named_params))
 
                     es_grads = {n: torch.zeros_like(p) for n, p in named_params.items()}
 
                     # Population loop (antithetic)
-                    # Population loop (antithetic)
-                    for i in range(int(args.es_popsize)):
-                        eps = sample_eps(named_params, "spsa" if args.es_algo == "spsa" else "es")
+                    for i in range(int(getattr(args, "es_popsize", 8))):
+                        eps = sample_eps(named_params, "spsa" if getattr(args, "es_algo", "es") == "spsa" else "es")
+                        # Common random numbers: fixed seed for the +/− pair
+                        use_common = bool(getattr(args, "es_common_seed", False))
+                        pair_seed = (args.seed + 17_000_000 * epoch + 10_000 * b + 100 * step_idx + i) if use_common else None
 
                         # -------- f(θ + σ ε)
-                        with PerturbContext(named_params, eps, args.es_sigma, +1):
+                        with PerturbContext(named_params, eps, getattr(args, "es_sigma", 0.02), +1):
                             bc_list_plus = []
-                            pg_list_plus = []
                             for tid in tasks_used:
                                 t = per_task_tensors[tid]
-                                bc_phi = meta_objective_from_rollout(
-                                    policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device
-                                )
-                                bc_list_plus.append(bc_phi)
-                                if args.outer_pg_coef and args.outer_pg_coef > 0.0:
-                                    rews = torch.clamp(t["rewards"] * args.rew_scale, -args.rew_clip, args.rew_clip)
-                                    pg_term = _outer_pg_term(policy_net, t["exp"], t["actions"], t["beh_logits"], rews, args)
-                                    pg_list_plus.append(pg_term)
+                                ro_plus = t["ro"]
+                                if getattr(args, "es_recollect_inner", False):
+                                    cfg = MazeTaskManager.TaskConfig(**t["task_dict"])
+                                    ro_plus = collect_explore_vec(
+                                        policy_net, [cfg], device, max_steps=250,
+                                        seed_base=(pair_seed if pair_seed is not None else args.seed + 99991 + i),
+                                        dbg=False, dbg_timing=False, dbg_level="WARNING"
+                                    ).pop()
 
-                            f_plus = torch.stack(bc_list_plus).mean()
-                            if args.outer_pg_coef and args.outer_pg_coef > 0.0 and len(pg_list_plus) > 0:
-                                # Δ-gate computed against bc@θ (no plastic)
-                                deltas_plus = torch.stack([bc_theta_map[tid] - bc for tid, bc in zip(tasks_used, bc_list_plus)])
-                                std_plus = deltas_plus.std(unbiased=False).clamp_min(1e-6)
-                                dnorm_plus = torch.clamp((deltas_plus - deltas_plus.mean()) / std_plus, -2.0, 2.0)
-                                if getattr(args, "delta_gate_relu", False):
-                                    dnorm_plus = torch.relu(dnorm_plus)
-                                pg_terms_plus = torch.stack(pg_list_plus)
-                                f_plus = f_plus + args.outer_pg_coef * (dnorm_plus * pg_terms_plus).mean()
+                                if use_pg_inner:
+                                    bc_phi = meta_objective_with_inner_pg(
+                                        policy_net,
+                                        ro_plus,
+                                        t["batch_obs"], t["batch_lab"],
+                                        args, device,
+                                        alpha=getattr(args, "es_inner_pg_alpha", 0.0),
+                                        scope=getattr(args, "es_inner_pg_scope", "head"),
+                                        use_is=inner_use_is,
+                                        is_clip_rho=getattr(args, "is_clip_rho", 0.0),
+                                        ess_min_ratio=(getattr(args, "es_ess_min_ratio", None) if not getattr(args, "es_recollect_inner", False) else None),
+                                    )
+                                else:
+                                    bc_phi = meta_objective_from_rollout(
+                                        policy_net,
+                                        ro_plus,
+                                        t["batch_obs"], t["batch_lab"],
+                                        args, device,
+                                        use_is_inner=(not getattr(args, "es_recollect_inner", False)) and bool(getattr(args, "es_use_is_inner", False)),
+                                        is_clip_rho=getattr(args, "is_clip_rho", 0.0),
+                                        ess_min_ratio=(getattr(args, "es_ess_min_ratio", None) if not getattr(args, "es_recollect_inner", False) else None),
+                                    )
+                                bc_list_plus.append(bc_phi)
+
+                            # drop tasks with NaN (ESS collapse)
+                            bc_list_plus = [x for x in bc_list_plus if torch.isfinite(x)]
+                            if bc_list_plus:
+                                f_plus = torch.stack(bc_list_plus).mean()
+                                if bool(getattr(args, "es_ranknorm", False)):
+                                    vals = torch.stack(bc_list_plus)
+                                    ranks = torch.argsort(torch.argsort(vals))
+                                    f_plus = ((ranks.float() + 0.5) / float(len(vals))).mean()
+                            else:
+                                f_plus = torch.tensor(f_theta_baseline, device=device)
 
                         # -------- f(θ - σ ε)
-                        with PerturbContext(named_params, eps, args.es_sigma, -1):
+                        with PerturbContext(named_params, eps, getattr(args, "es_sigma", 0.02), -1):
                             bc_list_minus = []
-                            pg_list_minus = []
                             for tid in tasks_used:
                                 t = per_task_tensors[tid]
-                                bc_phi = meta_objective_from_rollout(
-                                    policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device
-                                )
-                                bc_list_minus.append(bc_phi)
-                                if args.outer_pg_coef and args.outer_pg_coef > 0.0:
-                                    rews = torch.clamp(t["rewards"] * args.rew_scale, -args.rew_clip, args.rew_clip)
-                                    pg_term = _outer_pg_term(policy_net, t["exp"], t["actions"], t["beh_logits"], rews, args)
-                                    pg_list_minus.append(pg_term)
+                                ro_minus = t["ro"]
+                                if getattr(args, "es_recollect_inner", False):
+                                    cfg = MazeTaskManager.TaskConfig(**t["task_dict"])
+                                    ro_minus = collect_explore_vec(
+                                        policy_net, [cfg], device, max_steps=250,
+                                        seed_base=(pair_seed if pair_seed is not None else args.seed + 99991 + i),
+                                        dbg=False, dbg_timing=False, dbg_level="WARNING"
+                                    ).pop()
 
-                            f_minus = torch.stack(bc_list_minus).mean()
-                            if args.outer_pg_coef and args.outer_pg_coef > 0.0 and len(pg_list_minus) > 0:
-                                deltas_minus = torch.stack([bc_theta_map[tid] - bc for tid, bc in zip(tasks_used, bc_list_minus)])
-                                std_minus = deltas_minus.std(unbiased=False).clamp_min(1e-6)
-                                dnorm_minus = torch.clamp((deltas_minus - deltas_minus.mean()) / std_minus, -2.0, 2.0)
-                                if getattr(args, "delta_gate_relu", False):
-                                    dnorm_minus = torch.relu(dnorm_minus)
-                                pg_terms_minus = torch.stack(pg_list_minus)
-                                f_minus = f_minus + args.outer_pg_coef * (dnorm_minus * pg_terms_minus).mean()
+                                if use_pg_inner:
+                                    bc_phi = meta_objective_with_inner_pg(
+                                        policy_net,
+                                        ro_minus,
+                                        t["batch_obs"], t["batch_lab"],
+                                        args, device,
+                                        alpha=getattr(args, "es_inner_pg_alpha", 0.0),
+                                        scope=getattr(args, "es_inner_pg_scope", "head"),
+                                        use_is=inner_use_is,
+                                        is_clip_rho=getattr(args, "is_clip_rho", 0.0),
+                                        ess_min_ratio=(getattr(args, "es_ess_min_ratio", None) if not getattr(args, "es_recollect_inner", False) else None),
+                                    )
+                                else:
+                                    bc_phi = meta_objective_from_rollout(
+                                        policy_net,
+                                        ro_minus,
+                                        t["batch_obs"], t["batch_lab"],
+                                        args, device,
+                                        use_is_inner=(not getattr(args, "es_recollect_inner", False)) and bool(getattr(args, "es_use_is_inner", False)),
+                                        is_clip_rho=getattr(args, "is_clip_rho", 0.0),
+                                        ess_min_ratio=(getattr(args, "es_ess_min_ratio", None) if not getattr(args, "es_recollect_inner", False) else None),
+                                    )
+                                bc_list_minus.append(bc_phi)
+
+                            bc_list_minus = [x for x in bc_list_minus if torch.isfinite(x)]
+                            if bc_list_minus:
+                                f_minus = torch.stack(bc_list_minus).mean()
+                                if bool(getattr(args, "es_ranknorm", False)):
+                                    vals = torch.stack(bc_list_minus)
+                                    ranks = torch.argsort(torch.argsort(vals))
+                                    f_minus = ((ranks.float() + 0.5) / float(len(vals))).mean()
+                            else:
+                                f_minus = torch.tensor(f_theta_baseline, device=device)
 
                         # ES gradient estimate: g += [(f+ - f-) / (2σ)] * ε
-                        coeff = (f_plus - f_minus) / (2.0 * float(args.es_sigma))
+                        if bool(getattr(args, "es_fitness_baseline", False)):
+                            coeff = ((f_plus - f_theta_baseline) - (f_minus - f_theta_baseline)) / (2.0 * float(getattr(args, "es_sigma", 0.02)))
+                        else:
+                            coeff = (f_plus - f_minus) / (2.0 * float(getattr(args, "es_sigma", 0.02)))
                         for n, p in named_params.items():
                             es_grads[n] = es_grads[n].add_(coeff * eps[n])
 
-
                     # Average over population
                     for n in es_grads:
-                        es_grads[n].div_(float(args.es_popsize))
+                        es_grads[n].div_(float(getattr(args, "es_popsize", 8)))
 
                     # Apply gradients via existing optimizer
-                    # (leave grads at 0 for non-selected params)
                     for group in optimizer.param_groups:
                         for p in group["params"]:
-                            p.grad = None  # clear to avoid stale grads
+                            p.grad = None
                     for n, p in named_params.items():
                         p.grad = es_grads[n]
-                    if args.es_clip_grad and args.es_clip_grad > 0:
-                        torch.nn.utils.clip_grad_norm_(list(named_params.values()), args.es_clip_grad)
+                    if getattr(args, "es_clip_grad", 0.0) and getattr(args, "es_clip_grad", 0.0) > 0:
+                        torch.nn.utils.clip_grad_norm_(list(named_params.values()), getattr(args, "es_clip_grad", 1.0))
                     optimizer.step()
 
                     # housekeeping
@@ -662,22 +736,19 @@ def run_training():
                             torch.cuda.empty_cache()
                             updates_since_free = 0
 
-                    if is_verbose_batch:
+                    if log_every_step or is_verbose_batch:
                         msg = f"[ES STEP {step_idx+1}/{args.nbc}] bc(avg)={running_bc/max(1,count_updates):.4f}"
-                        if args.outer_pg_coef and count_updates > 0:
-                            msg += f" inrl(avg)={running_inrl/max(1,count_updates):.4f}"
                         if debug_mem:
                             msg += " | " + _cuda_mem("post-es", device)
                         logger.info(msg)
 
                     continue  # ES branch finished this step
 
-                # ----------- Backprop branch (original) -----------
+                # ----------- Backprop branch (original, pure-BC outer) -----------
                 optimizer.zero_grad(set_to_none=True)
 
                 loss_bc_list = []
                 delta_list = []
-                outer_pg_list = []
                 inrl_monitor_sum = 0.0
 
                 for idx_task, tid in enumerate(tasks_used):
@@ -689,7 +760,7 @@ def run_training():
                     # (optional) truncate explore window for speed
                     if args.adapt_trunc_T is not None and isinstance(args.adapt_trunc_T, int) and exp.shape[0] > args.adapt_trunc_T:
                         exp = exp[-args.adapt_trunc_T:]; acts = acts[-args.adapt_trunc_T:]; rews = rews[-args.adapt_trunc_T:]; beh  = beh[-args.adapt_trunc_T:]
-                    if is_verbose_batch and idx_task < debug_tasks_per_batch and debug_shapes and step_idx == 0:
+                    if is_verbose_batch and debug_shapes and idx_task < debug_tasks_per_batch and step_idx == 0:
                         logger.debug("[PLASTIC][TRUNC] tid=%s Tx_used=%d", tid, exp.shape[0])
 
                     # ---- pass 0: BC at θ (no plastic) for Δ gate ----
@@ -730,6 +801,15 @@ def run_training():
                     adv_norm = (adv - adv.mean()) / adv.std().clamp_min(1e-6)
                     m_t = adv_norm.clamp(-args.plastic_clip_mod, args.plastic_clip_mod)
 
+                    # Optional: IS-corrected plasticity when reusing behavior data
+                    if getattr(args, "inner_use_is_mod", False):
+                        lp_cur = torch.log_softmax(logits_theta, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+                        lp_beh = torch.log_softmax(beh,           dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+                        rho = torch.exp(lp_cur - lp_beh)
+                        if args.is_clip_rho and args.is_clip_rho > 0:
+                            rho = torch.clamp(rho, max=args.is_clip_rho)
+                        m_t = m_t * rho.detach()
+
                     if is_verbose_batch and debug_inner_per_task and idx_task < debug_tasks_per_batch:
                         logger.debug("[PLASTIC][MOD] tid=%s mean=%.3f std=%.3f min=%.3f max=%.3f",
                                      tid, float(m_t.mean()), float(m_t.std()), float(m_t.min()), float(m_t.max()))
@@ -750,39 +830,32 @@ def run_training():
                             loss_bc_phi = ce(logits_phi.reshape(-1, logits_phi.size(-1)), tensors["batch_lab"].reshape(-1))
                     loss_bc_list.append(loss_bc_phi)
 
-                    # Δ gate: positive => adaptation helped demos
+                    # Δ gate: positive => adaptation helped demos (for logging/optional weighting)
                     delta_k = (loss_bc_theta.detach() - loss_bc_phi.detach())
                     delta_list.append(delta_k)
 
-                    # Outer PG at θ with plain IS, weight applied later by Δ
-                    logp_cur = torch.log_softmax(logits_theta, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+                    # Monitor-only PG at θ (no IS weight here for monitoring stat)
                     with torch.no_grad():
-                        logp_beh = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
-                        rho = torch.exp(logp_cur.detach() - logp_beh)
-                        if args.is_clip_rho and args.is_clip_rho > 0:
-                            rho = torch.clamp(rho, max=args.is_clip_rho)
-                    outer_pg_k = - (rho * logp_cur * adv_norm.detach()).mean()
-                    outer_pg_list.append(outer_pg_k)
-
-                    with torch.no_grad():
-                        monitor_pg = - (logp_cur.detach() * adv_norm).mean()
+                        logp_cur = torch.log_softmax(logits_theta, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+                        monitor_pg = - (logp_cur * adv_norm).mean()
                         inrl_monitor_sum += float(monitor_pg.detach().cpu())
 
                 if len(loss_bc_list) == 0:
                     continue
 
+                # --- Keep outer loss pure BC; optionally reweight by standardized Δ across tasks ---
                 total_bc = sum(loss_bc_list) / float(len(loss_bc_list))
-                outer_pg = torch.tensor(0.0, device=device)
-                if getattr(args, "outer_pg_coef", 0.0) > 0.0:
+                if getattr(args, "delta_weight_mode", "none") != "none":
                     deltas = torch.stack(delta_list)
                     dnorm = (deltas - deltas.mean()) / deltas.std().clamp_min(1e-6)
-                    dnorm = torch.clamp(dnorm, -2.0, 2.0)
-                    if getattr(args, "delta_gate_relu", False):
+                    if getattr(args, "delta_weight_mode", "none") == "relu":
                         dnorm = torch.relu(dnorm)
-                    pg_terms = torch.stack(outer_pg_list)
-                    outer_pg = (dnorm * pg_terms).mean()
+                    # turn standardized Δ into positive weights
+                    w = (dnorm - dnorm.min()).detach() + 1e-6
+                    w = w / w.sum().clamp_min(1e-6)
+                    total_bc = (torch.stack(loss_bc_list) * w).sum()
 
-                avg_loss = total_bc + getattr(args, "outer_pg_coef", 0.0) * outer_pg
+                avg_loss = total_bc
 
                 # Safe AMP step
                 scaler.scale(avg_loss).backward()
@@ -808,7 +881,8 @@ def run_training():
                         torch.cuda.empty_cache()
                         updates_since_free = 0
 
-                if is_verbose_batch:
+                # <-- always log step if --log_every_step, else only when batch is verbose
+                if log_every_step or is_verbose_batch:
                     msg = f"[STEP {step_idx+1}/{args.nbc}] avg_bc={float(total_bc):.4f} inrl@theta(avg)={running_inrl/max(1,count_updates):.4f}"
                     if debug_mem:
                         msg += " | " + _cuda_mem("post-step", device)
@@ -818,7 +892,7 @@ def run_training():
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            if count_updates > 0:
+            if count_updates > 0 and not getattr(args, "no_tqdm", False):
                 pbar.set_postfix(
                     bc=f"{running_bc/max(1,count_updates):.3f}",
                     inrl=f"{running_inrl/max(1,count_updates):.3f}"
