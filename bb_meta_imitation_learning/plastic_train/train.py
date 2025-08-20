@@ -1,31 +1,21 @@
+# plastic_train/train.py
+
 import os
 import sys
 import json
 import math
 import random
-import datetime
 import logging
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 
-import time
 import numpy as np
 import torch
 from torch import nn
 from torch.amp import GradScaler, autocast
 from tqdm.auto import tqdm
-import gymnasium as gym
-from gymnasium.vector import AsyncVectorEnv
-
-try:
-    from torch.func import functional_call
-except Exception:
-    try:
-        from functorch import functional_call  # type: ignore
-    except Exception:
-        functional_call = None
 
 from bb_meta_imitation_learning.env.maze_task import MazeTaskManager
+
 from .config import parse_args
 from .model import build_model, save_checkpoint, load_checkpoint
 from .utils import (
@@ -35,13 +25,19 @@ from .utils import (
     SEQ_LEN,
     PAD_ACTION,
     smoothed_cross_entropy,
-    build_six_from_demo_sequence,
-    apply_brightness_contrast,
-    apply_gaussian_noise,
-    apply_spatial_jitter,
 )
-from .rl_loss import reinforce_with_baseline, mean_kl_logits, ess_ratio_from_rhos, discounted_returns
-from .phase1_shaping import Phase1ShapingWrapper
+from .data import (
+    concat_explore_and_exploit,
+    first_demo_paths,
+    assert_start_goal_match,
+    load_phase2_six_and_labels,
+    maybe_augment_demo_six_cpu,
+)
+from .explore import ExploreRollout, collect_explore_vec, make_base_env
+from .rl_loss import mean_kl_logits, ess_ratio_from_rhos, discounted_returns
+
+# ---- ES helpers ----
+from .es import select_es_named_params, sample_eps, PerturbContext, meta_objective_from_rollout
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +59,6 @@ def _maybe_set_debug_level(debug: bool, level: str):
     logging.getLogger().setLevel(lvl)
     logging.getLogger(__name__).setLevel(lvl)
 
-# ---------- misc utils ----------
 def _cuda_mem(prefix: str, device):
     if device.type != "cuda":
         return "CPU"
@@ -82,328 +77,87 @@ def _count_params(mod: nn.Module):
     return tot, train
 
 def _timer():
-    t0 = time.perf_counter()
-    return lambda: (time.perf_counter() - t0)
+    t0 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start, end = t0
+    def _fn():
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / 1000.0
+    start.record()
+    return _fn
 
-# ---------- named params helpers ----------
-def _named_params_and_buffers(net: nn.Module):
-    p = dict(net.named_parameters())
-    b = dict(net.named_buffers())
-    return p, b
+# ---------- optimizer helpers ----------
+def _find_encoder_module(net: torch.nn.Module):
+    cand = ["image_encoder", "cnn", "conv_frontend", "visual_encoder", "encoder", "backbone", "combined_encoder"]
+    root = net.core if hasattr(net, "core") else net
+    for name in cand:
+        mod = getattr(root, name, None)
+        if isinstance(mod, torch.nn.Module):
+            return mod, name
+    for name, mod in root.named_children():
+        lname = name.lower()
+        if any(k in lname for k in ["enc", "cnn", "conv", "vision", "image"]) and isinstance(mod, torch.nn.Module):
+            return mod, name
+    return None, None
 
-def _merge_params_and_buffers(params: Dict[str, torch.Tensor], buffers: Dict[str, torch.Tensor]):
-    merged = {}
-    merged.update(buffers)
-    merged.update(params)
-    return merged
+def _critic_param_names(net: nn.Module):
+    names = []
+    for n, _ in net.named_parameters():
+        ln = n.lower()
+        if ("value" in ln) or ("critic" in ln) or ("vf" in ln):
+            names.append(n)
+    return set(names)
 
-def _split_params_head_vs_rest(params: Dict[str, torch.Tensor], head_name_substr=("policy_head", "action_head", "logits")):
-    head = {k: v for k, v in params.items() if any(s in k for s in head_name_substr)}
-    rest = {k: v for k, v in params.items() if k not in head}
-    return head, rest
+# ---------- small helpers used in both paths ----------
+@torch.no_grad()
+def _compute_bc_theta(policy_net: nn.Module, batch_obs: torch.Tensor, batch_lab: torch.Tensor, args) -> torch.Tensor:
+    """BC loss at θ (no plastic) for Δ gate / monitoring."""
+    if hasattr(policy_net, "reset_plastic"):
+        policy_net.reset_plastic(batch_size=1, device=batch_obs.device)
+        policy_net.set_plastic(update_traces=False, modulators=None)
+    logits_bc_theta, _ = policy_net(batch_obs)
+    if args.label_smoothing > 0.0:
+        return smoothed_cross_entropy(logits_bc_theta, batch_lab, ignore_index=PAD_ACTION, smoothing=args.label_smoothing).detach()
+    ce = torch.nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
+    return ce(logits_bc_theta.reshape(-1, logits_bc_theta.size(-1)), batch_lab.reshape(-1)).detach()
 
-def _functional_forward(model: nn.Module, params: Dict[str, torch.Tensor], buffers: Dict[str, torch.Tensor], x: torch.Tensor):
-    if functional_call is None:
-        raise RuntimeError("functional_call is unavailable. Please use PyTorch >= 2.0 or install functorch.")
-    mapping = _merge_params_and_buffers(params, buffers)
-    return functional_call(model, mapping, (x,))
+@torch.no_grad()
+def _outer_pg_term(policy_net: nn.Module,
+                   exp: torch.Tensor, acts: torch.Tensor, beh_logits: torch.Tensor,
+                   rews: torch.Tensor, args) -> torch.Tensor:
+    """
+    Compute the small outer PG monitor term at θ (or perturbed θ), with IS clip.
+    """
+    if hasattr(policy_net, "reset_plastic"):
+        policy_net.reset_plastic(batch_size=1, device=exp.device)
+        policy_net.set_plastic(update_traces=False, modulators=None)
+    logits_theta, _ = policy_net(exp.unsqueeze(0))
+    logits_theta = logits_theta[0]
+    returns = discounted_returns(rews, args.gamma)
+    # per-task linear baseline
+    T = returns.size(0)
+    t = torch.arange(T, device=returns.device, dtype=returns.dtype)
+    zt = (t - t.mean()) / t.std().clamp_min(1e-6)
+    F = torch.stack([torch.ones_like(zt), zt], dim=1)
+    FT_F = F.T @ F + 1e-3 * torch.eye(2, device=returns.device, dtype=returns.dtype)
+    w = torch.linalg.solve(FT_F, F.T @ returns)
+    baseline = (F @ w)
+    adv = returns - baseline
+    adv_norm = (adv - adv.mean()) / adv.std().clamp_min(1e-6)
 
-def _split_trainable(params: Dict[str, torch.Tensor]):
-    trainable = {k: v for k, v in params.items() if v.requires_grad}
-    frozen    = {k: v for k, v in params.items() if not v.requires_grad}
-    return trainable, frozen
-
-# ---------- explore rollout cache ----------
-@dataclass
-class ExploreRollout:
-    obs6: torch.Tensor           # (T,6,H,W)  (CPU)
-    actions: torch.Tensor        # (T,)       (CPU)
-    rewards: torch.Tensor        # (T,)       (CPU)
-    beh_logits: torch.Tensor     # (T,A)      (CPU)
-    reuse_count: int
-
-# ---------- env makers ----------
-def _make_base_env():
-    try:
-        env = gym.make("MetaMazeDiscrete3D-v0", enable_render=False)
-    except ModuleNotFoundError:
-        import importlib
-        try:
-            pkg = importlib.import_module("bb_meta_imitation_learning.env")
-            sys.modules.setdefault("env", pkg)
-            sys.modules.setdefault("env.maze_env", importlib.import_module("bb_meta_imitation_learning.env.maze_env"))
-            env = gym.make("MetaMazeDiscrete3D-v0", enable_render=False)
-        except Exception:
-            from bb_meta_imitation_learning.env.maze_env import MetaMazeDiscrete3D
-            env = MetaMazeDiscrete3D(enable_render=False)
-    return env
-
-def _make_env_fn_with_task(task_cfg: MazeTaskManager.TaskConfig):
-    def _thunk():
-        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-        os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-        os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp")
-        os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-        env = _make_base_env()
-        env.unwrapped.set_task(task_cfg)
-        env = Phase1ShapingWrapper(env)  # shaping only affects phase-1
-        return env
-    return _thunk
-
-# ---------- vectorized explore collection (debuggable) ----------
-def _collect_explore_vec(
-    policy_net,
-    task_cfgs: List[MazeTaskManager.TaskConfig],
-    device,
-    max_steps: int = 250,
-    seed_base: Optional[int] = None,
-    dbg=False, dbg_timing=True, dbg_level="INFO"
-) -> List[ExploreRollout]:
-    import time as _time
-    n = len(task_cfgs)
-    if n == 0:
-        return []
-    vec_env = gym.vector.AsyncVectorEnv([_make_env_fn_with_task(cfg) for cfg in task_cfgs], shared_memory=False)
-
-    if dbg:
-        try:
-            is_async = isinstance(vec_env, gym.vector.AsyncVectorEnv)
-        except Exception:
-            is_async = "AsyncVectorEnv" in type(vec_env).__name__
-        logger.info(f"[VEC] created {type(vec_env).__name__} async={bool(is_async)} num_envs={getattr(vec_env,'num_envs',n)}")
-
-    t0_total = _time.time()
-    t_env = 0.0
-    t_net = 0.0
-    fwd_calls_total = 0
-    fwd_calls_batched = 0
-    fwd_batch_size_accum = 0
-    b_alive_hist = {}
-
-    try:
-        try:
-            obs_batch, _ = vec_env.reset(seed=([int(seed_base + i) for i in range(n)] if seed_base is not None else None))
-        except TypeError:
-            obs_batch = vec_env.reset(seed=([int(seed_base + i) for i in range(n)] if seed_base is not None else None))
-
-        obs0 = obs_batch[0]
-        if obs0.ndim == 3 and obs0.shape[-1] == 3:
-            H, W = int(obs0.shape[0]), int(obs0.shape[1])
-        elif obs0.ndim == 3 and obs0.shape[0] == 3:
-            H, W = int(obs0.shape[1]), int(obs0.shape[2])
-        else:
-            H, W = int(obs0.shape[0]), int(obs0.shape[1])
-
-        states_buf = [torch.empty((max_steps, 6, H, W), device=device, dtype=torch.float32) for _ in range(n)]
-        beh_logits_buf: List[List[torch.Tensor]] = [[] for _ in range(n)]
-        actions_list: List[List[int]] = [[] for _ in range(n)]
-        rewards_list: List[List[float]] = [[] for _ in range(n)]
-        steps_i = [0 for _ in range(n)]
-        alive = [True for _ in range(n)]
-        last_a = [0.0 for _ in range(n)]
-        last_r = [0.0 for _ in range(n)]
-        last_obs = list(obs_batch)
-        n_alive = n
-
-        while n_alive > 0:
-            alive_indices = []
-            for i in range(n):
-                if not alive[i]:
-                    continue
-                obsi = last_obs[i]
-                if obsi.ndim == 3 and obsi.shape[-1] == 3:
-                    img_np = obsi.transpose(2, 0, 1)
-                elif obsi.ndim == 3 and obsi.shape[0] == 3:
-                    img_np = obsi
-                else:
-                    img_np = obsi.transpose(2, 0, 1)
-                img = torch.from_numpy(img_np).to(device=device, dtype=torch.float32) / 255.0
-                pa = torch.full((1, H, W), last_a[i], device=device, dtype=torch.float32)
-                pr = torch.full((1, H, W), last_r[i], device=device, dtype=torch.float32)
-                bb = torch.zeros((1, H, W), device=device, dtype=torch.float32)
-                obs6_t = torch.cat([img, pa, pr, bb], dim=0)
-                states_buf[i][steps_i[i]] = obs6_t
-                alive_indices.append(i)
-
-            t_net_start = _time.time()
-            B_alive = len(alive_indices)
-            b_alive_hist[B_alive] = b_alive_hist.get(B_alive, 0) + 1
-            T_lens = [steps_i[i] + 1 for i in alive_indices]
-            T_max = max(T_lens)
-            batch_seq = torch.zeros((B_alive, T_max, 6, H, W), device=device, dtype=torch.float32)
-            for bi, i in enumerate(alive_indices):
-                t = T_lens[bi]
-                batch_seq[bi, -t:, :, :, :] = states_buf[i][:t]
-
-            if hasattr(policy_net, "reset_plastic"):
-                policy_net.reset_plastic(batch_size=B_alive, device=device)
-                policy_net.set_plastic(update_traces=False, modulators=None)
-
-            with torch.inference_mode():
-                logits_batch, _ = policy_net(batch_seq)
-                logits_last = logits_batch[:, -1, :]
-
-            dist = torch.distributions.Categorical(logits=logits_last)
-            actions_alive = dist.sample().detach().cpu().numpy().astype(np.int64)
-
-            for bi, i in enumerate(alive_indices):
-                beh_logits_buf[i].append(logits_last[bi].detach().cpu())
-
-            t_net += (_time.time() - t_net_start)
-            fwd_calls_total += 1
-            fwd_batch_size_accum += B_alive
-            if B_alive >= 2:
-                fwd_calls_batched += 1
-
-            t_env_start = _time.time()
-            actions = np.zeros((n,), dtype=np.int64)
-            for bi, i in enumerate(alive_indices):
-                actions[i] = actions_alive[bi]
-            obs_batch, rew_batch, term_batch, trunc_batch, info_batch = vec_env.step(actions)
-            t_env += (_time.time() - t_env_start)
-
-            for bi, i in enumerate(alive_indices):
-                rewards_list[i].append(float(rew_batch[i]))
-                actions_list[i].append(int(actions[i]))
-                last_a[i] = float(actions[i])
-                last_r[i] = float(rew_batch[i])
-                last_obs[i] = obs_batch[i]
-                steps_i[i] += 1
-                if steps_i[i] >= max_steps or bool(term_batch[i]) or bool(trunc_batch[i]):
-                    alive[i] = False
-                    n_alive -= 1
-
-            if all(si >= max_steps for si in steps_i):
-                break
-
-        rollouts: List[ExploreRollout] = []
-        for i in range(n):
-            T_i = steps_i[i]
-            obs6 = states_buf[i][:T_i].contiguous().detach().cpu()
-            actions = torch.tensor(actions_list[i], dtype=torch.long)
-            rewards = torch.tensor(rewards_list[i], dtype=torch.float32)
-            beh_logits = torch.stack(beh_logits_buf[i], dim=0).detach().cpu()
-            rollouts.append(ExploreRollout(obs6=obs6, actions=actions, rewards=rewards, beh_logits=beh_logits, reuse_count=0))
-
-        if dbg:
-            elapsed = _time.time() - t0_total
-            total_steps = sum(steps_i)
-            avg_fwd_batch = (fwd_batch_size_accum / max(fwd_calls_total, 1))
-            vec_ratio = 100.0 * (fwd_calls_batched / max(fwd_calls_total, 1))
-            logger.info(
-                "[VEC][SUMMARY] envs=%d total_steps=%d elapsed=%.2fs env=%.2fs net=%.2fs "
-                "throughput=%.1f steps/s fwd_calls=%d batched_calls=%d (%.1f%%) avg_fwd_batch=%.2f",
-                n, total_steps, elapsed, t_env, t_net,
-                (total_steps / max(elapsed, 1e-6)), fwd_calls_total, fwd_calls_batched,
-                vec_ratio, avg_fwd_batch
-            )
-            hist_str = ", ".join(f"{k}:{v}" for k, v in sorted(b_alive_hist.items()))
-            logger.info(f"[VEC][B_ALIVE_HIST] {hist_str}")
-
-        del states_buf, beh_logits_buf
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        return rollouts
-
-    finally:
-        try:
-            vec_env.close()
-        except Exception:
-            pass
-
-# ---------- demo concat & mild augmentation ----------
-def _concat_explore_and_exploit(explore_six: torch.Tensor, exploit_six: torch.Tensor, exploit_labels: torch.Tensor):
-    Tx = explore_six.shape[0]
-    Te = exploit_six.shape[0]
-    exploit_six = exploit_six.clone()
-    if Te > 0:
-        exploit_six[:, 5, :, :] = 1.0
-    obs6_cat = torch.cat([explore_six, exploit_six], dim=0)
-    labels_cat = torch.cat(
-        [torch.full((Tx,), PAD_ACTION, dtype=torch.long, device=explore_six.device), exploit_labels],
-        dim=0
-    )
-    return obs6_cat, labels_cat, None, None
-
-def _first_demo_paths(ex_record_list: List[Dict], demo_root: str) -> List[str]:
-    demos_p2 = [r for r in ex_record_list if int(r.get("phase", 2)) == 2]
-    demos_p2 = sorted(demos_p2, key=lambda r: r["frames"])
-    return [os.path.join(demo_root, r["file"]) for r in demos_p2]
-
-def _manifest_p2_pairs(recs: List[Dict]) -> List[Tuple[int, int, int, int]]:
-    pairs = []
-    for r in recs:
-        if int(r.get("phase", 2)) != 2:
-            continue
-        sx, sy = r.get("start_x"), r.get("start_y")
-        gx, gy = r.get("goal_x"), r.get("goal_y")
-        if sx is None or sy is None or gx is None or gy is None:
-            continue
-        pairs.append((int(sx), int(sy), int(gx), int(gy)))
-    return pairs
-
-def _assert_start_goal_match(recs: List[Dict], tdict: Dict, tid: int):
-    pairs = _manifest_p2_pairs(recs)
-    if not pairs:
-        return
-    uniq = {pairs[0]}
-    for p in pairs[1:]:
-        uniq.add(p)
-    if len(uniq) > 1:
-        raise RuntimeError(
-            f"[TASK {tid}] Demo manifest contains multiple (start,goal) pairs for phase-2: {sorted(list(uniq))}"
-        )
-    msx, msy, mgx, mgy = pairs[0]
-    ts = tuple(tdict.get("start", (None, None)))
-    tg = tuple(tdict.get("goal", (None, None)))
-    if ts != (msx, msy) or tg != (mgx, mgy):
-        raise RuntimeError(
-            f"[TASK {tid}] train_trials.json start/goal {ts}->{tg} do not match manifest {(msx, msy)}->{(mgx, mgy)}"
-        )
-
-def _load_phase2_six_and_labels(demo_path: str, prev_action_start: float):
-    d = np.load(demo_path)
-    obs = d["observations"].astype(np.float32) / 255.0
-    acts = d["actions"].astype(np.int64)
-    L = len(acts)
-    boundary = np.zeros((L,), dtype=np.float32)
-    six = build_six_from_demo_sequence(obs, acts, boundary, prev_action_start=prev_action_start)
-    return torch.from_numpy(six).float(), torch.from_numpy(acts).long()
-
-def _maybe_augment_demo_six_cpu(p2_six_cpu: torch.Tensor, args) -> torch.Tensor:
-    if not bool(getattr(args, "use_aug", False)):
-        return p2_six_cpu
-    if np.random.rand() > float(getattr(args, "aug_prob", 0.5)):
-        return p2_six_cpu
-    b_rng = getattr(args, "aug_brightness_range", (0.9, 1.1))
-    c_rng = getattr(args, "aug_contrast_range",   (0.9, 1.1))
-    noise_std   = float(getattr(args, "aug_noise_std", 0.02))
-    jitter_max  = int(getattr(args, "aug_jitter_max", 2))
-    p_bc        = float(getattr(args, "aug_bc_prob",   0.5))
-    p_noise     = float(getattr(args, "aug_noise_prob", 0.25))
-    p_jitter    = float(getattr(args, "aug_jitter_prob", 0.25))
-    x = p2_six_cpu.numpy()
-    imgs = x[:, 0:3, :, :]
-    if np.random.rand() < p_bc:
-        imgs = apply_brightness_contrast(imgs, brightness_range=b_rng, contrast_range=c_rng)
-    if np.random.rand() < p_noise:
-        imgs = apply_gaussian_noise(imgs, std=noise_std)
-    if np.random.rand() < p_jitter:
-        imgs = apply_spatial_jitter(imgs, max_shift=jitter_max)
-    x[:, 0:3, :, :] = imgs
-    return torch.from_numpy(x).float()
+    logp_cur = torch.log_softmax(logits_theta, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+    logp_beh = torch.log_softmax(beh_logits, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+    rho = torch.exp(logp_cur - logp_beh)
+    if args.is_clip_rho and args.is_clip_rho > 0:
+        rho = torch.clamp(rho, max=args.is_clip_rho)
+    return ( - (rho * logp_cur * adv_norm).mean() ).detach()
 
 # ---------- training loop ----------
 def run_training():
+    from .remap import remap_pretrained_state  # local import to keep module edges clean
+
     args = parse_args()
     _setup_logging()
-
-    # Derived knobs
-    nbc = int(getattr(args, "nbc", 16))
-    inner_lr = float(getattr(args, "inner_lr", 3e-4))          # used only in grad inner
-    inner_trunc_T = getattr(args, "inner_trunc_T", 250)
-    head_only_inner = bool(getattr(args, "head_only_inner", True))
-    inner_mode = str(getattr(args, "inner_mode", "grad")).lower()
 
     # Debug flags
     debug = bool(getattr(args, "debug", False))
@@ -416,15 +170,12 @@ def run_training():
     debug_shapes = bool(getattr(args, "debug_shapes", True))
     _maybe_set_debug_level(debug, debug_level)
 
-    logger.info("[SETUP] inner_mode=%s nbc=%d head_only_inner=%s inner_lr=%.2e inner_trunc_T=%s",
-                inner_mode, nbc, str(head_only_inner), inner_lr, str(inner_trunc_T))
-
     # Seeding
     random.seed(args.seed); np.random.seed(args.seed)
     torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    logger.info("[SETUP] seed=%d cudnn.deterministic=%s benchmark=%s", args.seed, True, False)
+    logger.info("[SETUP] seed=%d", args.seed)
 
     os.makedirs(args.save_path, exist_ok=True)
     os.makedirs(args.load_path, exist_ok=True)
@@ -442,6 +193,7 @@ def run_training():
     logger.info("[DATA] loaded train_trials=%s num_tasks=%d", args.train_trials, len(tasks_all))
 
     # Load demo manifests
+    from .utils import load_all_manifests
     demos_by_task = load_all_manifests(args.demo_root)
     if not demos_by_task:
         raise RuntimeError("No demo manifests found in demo_root.")
@@ -458,8 +210,8 @@ def run_training():
             tdict = task_hash_to_dict[tid]
         else:
             continue
-        _assert_start_goal_match(recs, tdict, tid)
-        p2_paths = _first_demo_paths(recs, args.demo_root)
+        assert_start_goal_match(recs, tdict, tid)
+        p2_paths = first_demo_paths(recs, args.demo_root)
         if len(p2_paths) == 0:
             continue
         tasks.append({"task_id": tid, "task_dict": tdict, "p2_paths": p2_paths})
@@ -472,10 +224,10 @@ def run_training():
     train_tasks = tasks[n_val:]
     logger.info("[SPLIT] train=%d val=%d (val_size=%d)", len(train_tasks), len(val_tasks), n_val)
 
-    # Model
+    # Model (plastic head only)
     policy_net = build_model(
         seq_len=SEQ_LEN,
-        use_plastic_head=(inner_mode == "plastic"),
+        use_plastic_head=True,
         plastic_rule=getattr(args, "plastic_rule", "oja"),
         plastic_init_eta=getattr(args, "plastic_eta", 0.1),
         plastic_learn_eta=bool(getattr(args, "plastic_learn_eta", False)),
@@ -483,37 +235,22 @@ def run_training():
     tot, trn = _count_params(policy_net)
     logger.info("[MODEL] built model params total=%d trainable=%d", tot, trn)
 
+    # ---------- Load BC init + remap (no extra checks) ----------
     if args.bc_init:
         ck_path = os.path.abspath(args.bc_init)
         if not os.path.isfile(ck_path):
             raise FileNotFoundError(f"{ck_path} not found")
-        sd = torch.load(ck_path, map_location="cpu")
-        ret = policy_net.load_state_dict(sd, strict=False)
+        raw_sd = torch.load(ck_path, map_location="cpu")
+        remap_sd = remap_pretrained_state(raw_sd, policy_net)
+        ret = policy_net.load_state_dict(remap_sd, strict=False)
         miss = getattr(ret, "missing_keys", []); unex = getattr(ret, "unexpected_keys", [])
-        logger.info(f"[INIT] loaded BC init from {ck_path} (missing={len(miss)}, unexpected={len(unex)})")
+        logger.info(f"[INIT] loaded BC init (after remap) from {ck_path} "
+                    f"(matched={len(remap_sd)} missing={len(miss)} unexpected={len(unex)})")
+        logger.info("[INIT] plastic head fast weights (H, _eta_const/param) missing in ckpt is expected.")
+    else:
+        logger.info("[INIT] No BC init provided.")
 
-    # -------- optimizer(s) with encoder warmup + separate critic head --------
-    def _find_encoder_module(net: torch.nn.Module):
-        cand = ["image_encoder", "cnn", "conv_frontend", "visual_encoder", "encoder", "backbone", "combined_encoder"]
-        for name in cand:
-            mod = getattr(net.core if hasattr(net, "core") else net, name, None)
-            if isinstance(mod, torch.nn.Module):
-                return mod, name
-        for name, mod in (net.core if hasattr(net, "core") else net).named_children():
-            lname = name.lower()
-            if any(k in lname for k in ["enc", "cnn", "conv", "vision", "image"]) and isinstance(mod, torch.nn.Module):
-                return mod, name
-        return None, None
-
-    # identify critic head params by name
-    def _critic_param_names(net: nn.Module):
-        names = []
-        for n, p in net.named_parameters():
-            ln = n.lower()
-            if ("value" in ln) or ("critic" in ln) or ("vf" in ln):
-                names.append(n)
-        return set(names)
-
+    # -------- optimizer(s): encoder warmup + separate critic head --------
     encoder_module, enc_name = _find_encoder_module(policy_net)
     critic_names = _critic_param_names(policy_net)
 
@@ -521,6 +258,7 @@ def run_training():
     critic_params = [all_named_params[n] for n in critic_names]
     non_critic_params = [p for n,p in all_named_params.items() if n not in critic_names]
 
+    warmup_epochs = max(0, int(args.freeze_encoder_warmup_epochs))
     if encoder_module is None:
         logger.warning("No visual encoder detected; single param group (excluding critic head).")
         optimizer = torch.optim.Adam([p for p in non_critic_params], lr=args.lr, weight_decay=args.weight_decay)
@@ -528,14 +266,13 @@ def run_training():
     else:
         have_encoder = True
         logger.info(f"[ENCODER] Using submodule '{enc_name}'.")
-        warmup = max(0, int(args.freeze_encoder_warmup_epochs))
         enc_params = list(encoder_module.parameters())
         enc_ids = {id(p) for p in enc_params}
         rest_params = [p for p in non_critic_params if id(p) not in enc_ids]
-        if warmup > 0:
+        if warmup_epochs > 0:
             for p in encoder_module.parameters(): p.requires_grad = False
             optimizer = torch.optim.Adam(rest_params, lr=args.lr, weight_decay=args.weight_decay)
-            logger.info(f"[ENCODER] Frozen for first {warmup} epoch(s).")
+            logger.info(f"[ENCODER] Frozen for first {warmup_epochs} epoch(s).")
         else:
             for p in encoder_module.parameters(): p.requires_grad = True
             optimizer = torch.optim.Adam(
@@ -546,7 +283,7 @@ def run_training():
             )
             logger.info(f"[ENCODER] No warmup; encoder lr mult = {args.encoder_lr_mult}.")
 
-    # separate critic-only optimizer (head params only)
+    # separate critic-only optimizer (optional aux)
     if len(critic_params) == 0:
         logger.warning("[CRITIC] No params matched value/critic head names; critic aux updates will be skipped.")
         opt_critic = None
@@ -557,10 +294,10 @@ def run_training():
     # Resume
     start_epoch, best_val_score = load_checkpoint(policy_net, args.load_path)
     best_epoch = start_epoch
-    logger.info(f"[RESUME] from epoch {start_epoch + 1}]")
+    logger.info("[RESUME] from epoch %d", start_epoch + 1)
 
     # Val env
-    val_env = _make_base_env()
+    val_env = make_base_env()
     val_env.action_space.seed(args.seed)
 
     patience = 0
@@ -575,7 +312,7 @@ def run_training():
         final_epoch = epoch
         logger.info("========== [EPOCH %02d/%02d] ==========", epoch, args.epochs)
 
-        if have_encoder and args.freeze_encoder_warmup_epochs > 0 and epoch == (args.freeze_encoder_warmup_epochs + 1):
+        if have_encoder and warmup_epochs > 0 and epoch == (warmup_epochs + 1):
             for p in encoder_module.parameters(): p.requires_grad = True
             enc_params = list(encoder_module.parameters())
             enc_ids = {id(p) for p in enc_params}
@@ -601,7 +338,6 @@ def run_training():
 
         pbar = tqdm(range(num_batches), desc=f"[Epoch {epoch:02d}] train", leave=False)
         for b in pbar:
-            btimer = _timer() if debug_timing else None
             is_verbose_batch = debug and ((b % max(1, debug_every_batches)) == 0)
 
             start = b * args.batch_size
@@ -627,7 +363,7 @@ def run_training():
             for off in range(0, len(need_collect), max(1, _vec_cap)):
                 slice_tasks = need_collect[off: off + max(1, _vec_cap)]
                 cfgs = [MazeTaskManager.TaskConfig(**t["task_dict"]) for t in slice_tasks]
-                ro_list = _collect_explore_vec(
+                ro_list = collect_explore_vec(
                     policy_net, cfgs, device, max_steps=250,
                     seed_base=args.seed + 100000 * epoch + 1000 * b + off,
                     dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level
@@ -648,9 +384,9 @@ def run_training():
                 cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
                 ro = explore_cache.get(tid, None)
                 if ro is None:
-                    ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250,
-                                              seed_base=args.seed + 424242,
-                                              dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
+                    ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
+                                             seed_base=args.seed + 424242,
+                                             dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
                     explore_cache[tid] = ro
 
                 exp_six_dev  = ro.obs6.to(device, non_blocking=True)
@@ -667,9 +403,9 @@ def run_training():
                 if is_verbose_batch and idx_task < debug_tasks_per_batch:
                     logger.info("[KL] tid=%s mean_kl=%.4f thr=%.4f", tid, kl_val, args.kl_refresh_threshold)
                 if kl_val > args.kl_refresh_threshold:
-                    ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250,
-                                              seed_base=args.seed + 999999,
-                                              dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
+                    ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
+                                             seed_base=args.seed + 999999,
+                                             dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
                     explore_cache[tid] = ro
                     exp_six_dev  = ro.obs6.to(device, non_blocking=True)
                     actions_x    = ro.actions.to(device, non_blocking=True)
@@ -679,29 +415,30 @@ def run_training():
                     if is_verbose_batch:
                         logger.info("[KL][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
-                # ESS refresh guard
-                with torch.no_grad():
-                    logits_now, _ = policy_net(exp_six_dev.unsqueeze(0))
-                    logits_now = logits_now[0] if logits_now.dim() == 3 else logits_now
-                    lp_cur = torch.log_softmax(logits_now, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
-                    lp_beh = torch.log_softmax(beh_logits_x, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
-                    rhos = torch.exp(lp_cur - lp_beh)
-                    ess_ratio = ess_ratio_from_rhos(rhos).item()
-                if is_verbose_batch and idx_task < debug_tasks_per_batch:
-                    logger.info("[ESS] tid=%s Tx=%d ess_ratio=%.3f thr=%.3f reuse_count=%d",
-                                tid, Tx, ess_ratio, args.ess_refresh_ratio, ro.reuse_count)
-                if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio < args.ess_refresh_ratio:
-                    ro = _collect_explore_vec(policy_net, [cfg], device, max_steps=250,
-                                              seed_base=args.seed + 31337,
-                                              dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
-                    explore_cache[tid] = ro
-                    exp_six_dev  = ro.obs6.to(device, non_blocking=True)
-                    actions_x    = ro.actions.to(device, non_blocking=True)
-                    rewards_x    = ro.rewards.to(device, non_blocking=True)
-                    beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
-                    Tx = exp_six_dev.shape[0]
+                # ESS guard (optional)
+                if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
+                    with torch.no_grad():
+                        logits_now, _ = policy_net(exp_six_dev.unsqueeze(0))
+                        logits_now = logits_now[0] if logits_now.dim() == 3 else logits_now
+                        lp_cur = torch.log_softmax(logits_now, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
+                        lp_beh = torch.log_softmax(beh_logits_x, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
+                        rhos = torch.exp(lp_cur - lp_beh)
+                        ess_ratio = ess_ratio_from_rhos(rhos).item()
                     if is_verbose_batch and idx_task < debug_tasks_per_batch:
-                        logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
+                        logger.info("[ESS] tid=%s Tx=%d ess_ratio=%.3f thr=%.3f reuse_count=%d",
+                                    tid, Tx, ess_ratio, args.ess_refresh_ratio, ro.reuse_count)
+                    if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio < args.ess_refresh_ratio:
+                        ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
+                                                 seed_base=args.seed + 31337,
+                                                 dbg=is_verbose_batch, dbg_timing=debug_timing, dbg_level=debug_level).pop()
+                        explore_cache[tid] = ro
+                        exp_six_dev  = ro.obs6.to(device, non_blocking=True)
+                        actions_x    = ro.actions.to(device, non_blocking=True)
+                        rewards_x    = ro.rewards.to(device, non_blocking=True)
+                        beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
+                        Tx = exp_six_dev.shape[0]
+                        if is_verbose_batch and idx_task < debug_tasks_per_batch:
+                            logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
                 # Build batched BC tensors from ALL demos (once)
                 prev_action_start = float(actions_x[-1].item()) if Tx > 0 else 0.0
@@ -709,13 +446,13 @@ def run_training():
                 demo_lab_list: List[torch.Tensor] = []
 
                 for demo_path in task["p2_paths"]:
-                    p2_six, p2_labels = _load_phase2_six_and_labels(demo_path, prev_action_start=prev_action_start)
+                    p2_six, p2_labels = load_phase2_six_and_labels(demo_path, prev_action_start=prev_action_start)
                     if p2_six.numel() == 0:
                         continue
-                    p2_six = _maybe_augment_demo_six_cpu(p2_six, args)
+                    p2_six = maybe_augment_demo_six_cpu(p2_six, args)
                     p2_six = p2_six.to(device, non_blocking=True)
                     p2_labels = p2_labels.to(device, non_blocking=True)
-                    obs6_cat, labels_cat, _, _ = _concat_explore_and_exploit(exp_six_dev, p2_six, p2_labels)
+                    obs6_cat, labels_cat = concat_explore_and_exploit(exp_six_dev, p2_six, p2_labels)
                     demo_obs_list.append(obs6_cat)
                     demo_lab_list.append(labels_cat)
 
@@ -752,6 +489,7 @@ def run_training():
                     "actions": actions_x,
                     "rewards": rewards_x,
                     "beh_logits": beh_logits_x,
+                    "ro": ro,
                 }
                 tasks_used.append(tid)
 
@@ -764,7 +502,7 @@ def run_training():
             if is_verbose_batch and debug_mem:
                 logger.info("[MEM][PRE-K] %s", _cuda_mem("pre-k", device))
 
-            # -------- Critic auxiliary regression (stabilizes advantages) --------
+            # -------- Critic auxiliary regression (optional) --------
             if opt_critic is not None and args.critic_aux_steps > 0:
                 for s in range(args.critic_aux_steps):
                     opt_critic.zero_grad(set_to_none=True)
@@ -774,7 +512,6 @@ def run_training():
                         exp = tensors["exp"]
                         rews = tensors["rewards"] * args.rew_scale
                         rews = torch.clamp(rews, -args.rew_clip, args.rew_clip)
-
                         with autocast(device_type="cuda", enabled=use_amp):
                             _, values_x = policy_net(exp.unsqueeze(0))
                             values_x = values_x[0]
@@ -787,7 +524,6 @@ def run_training():
                             else:
                                 vloss = 0.5 * (values_x - targets.detach()).pow(2).mean()
                         vlosses.append(vloss)
-
                     if vlosses:
                         vloss = sum(vlosses) / float(len(vlosses))
                         vloss.backward()
@@ -797,209 +533,268 @@ def run_training():
                             logger.info("[CRITIC][AUX] step=%d/%d vloss=%.4f", s+1, args.critic_aux_steps, float(vloss.detach().cpu()))
 
             # =========================
-            # OUTER LOOP: MRI-style or PLASTIC (k steps)
+            # OUTER LOOP
             # =========================
-            for step_idx in range(nbc):
-                ktimer = _timer() if debug_timing else None
-                params_theta_named, buffers_named = _named_params_and_buffers(policy_net)
-                trainable_named, frozen_named = _split_trainable(params_theta_named)
+            for step_idx in range(args.nbc):
 
-                if inner_mode == "grad":
-                    # Head selection: policy-only by default; include critic if requested
-                    head_sub = ("policy_head", "action_head", "logits")
-                    if args.critic_in_inner:
-                        head_sub = head_sub + ("value", "critic", "vf")
-                    head_theta_named, _ = _split_params_head_vs_rest(trainable_named, head_sub)
-                    rest_theta_named = {**frozen_named, **{k: v for k, v in params_theta_named.items() if k not in head_theta_named}}
-
-                    loss_bc_list = []
-                    inrl_monitor_sum = 0.0
+                # ----------- ES/SPSA branch (black-box outer) -----------
+                if getattr(args, "es_enabled", False):
                     optimizer.zero_grad(set_to_none=True)
 
+                    # Precompute BC@θ (no plastic) per task for Δ-gate
+                    bc_theta_map: Dict[int, torch.Tensor] = {}
                     for idx_task, tid in enumerate(tasks_used):
                         tensors = per_task_tensors[tid]
-                        exp = tensors["exp"]; acts = tensors["actions"]; beh = tensors["beh_logits"]
-                        rews_raw = tensors["rewards"]
-                        # reward preprocessing
-                        rews = torch.clamp(rews_raw * args.rew_scale, -args.rew_clip, args.rew_clip)
+                        bc_theta = _compute_bc_theta(policy_net, tensors["batch_obs"], tensors["batch_lab"], args)
+                        bc_theta_map[tid] = bc_theta
 
-                        Tx_full = exp.shape[0]
-                        if inner_trunc_T is not None and isinstance(inner_trunc_T, int) and exp.shape[0] > inner_trunc_T:
-                            exp = exp[-inner_trunc_T:]; acts = acts[-inner_trunc_T:]; rews = rews[-inner_trunc_T:]; beh  = beh[-inner_trunc_T:]
-                        if is_verbose_batch and idx_task < debug_tasks_per_batch and debug_shapes and step_idx == 0:
-                            logger.debug("[INNER][TRUNC] tid=%s Tx_full=%d Tx_used=%d", tid, Tx_full, exp.shape[0])
-
-                        # (a) Inner RL loss at θ
-                        with autocast(device_type="cuda", enabled=use_amp):
-                            logits_all, values_all = _functional_forward(policy_net, {**rest_theta_named, **head_theta_named}, buffers_named, exp.unsqueeze(0))
-                            logits_x = logits_all[0]
-                            values_x = values_all[0]
-
-                            loss_in, ent_x, _ = reinforce_with_baseline(
-                                cur_logits=logits_x,
-                                actions=acts,
-                                rewards=rews,
-                                values=values_x,
-                                gamma=args.gamma, lam=args.gae_lambda, use_gae=args.use_gae,
-                                entropy_coef=args.explore_entropy_coef,
-                                behavior_logits=(beh if args.offpolicy_correction!="none" else None),
-                                offpolicy=args.offpolicy_correction,
-                                is_clip_rho=args.is_clip_rho,
-                                normalize_adv=args.adv_norm,
-                                value_clip=args.critic_value_clip,
-                            )
-
-                        # (optional) add small OUTER PG term at θ to encourage exploration learning directly
-                        outer_pg = torch.tensor(0.0, device=exp.device)
-                        if args.outer_pg_coef and args.outer_pg_coef > 0.0:
-                            with torch.no_grad():
-                                logp_all = torch.log_softmax(logits_x, dim=-1)
-                                adv = discounted_returns(rews, args.gamma) - values_x.detach()
-                                if args.adv_norm:
-                                    adv = (adv - adv.mean()) / adv.std().clamp_min(1e-8)
-                            logp_cur = torch.gather(logp_all, -1, acts.unsqueeze(-1)).squeeze(-1)
-                            outer_pg = -(logp_cur * adv).mean() * args.outer_pg_coef
-
-                        inrl_monitor_sum += float(loss_in.detach().cpu())
-                        if is_verbose_batch and debug_inner_per_task and idx_task < debug_tasks_per_batch:
-                            logger.debug("[INNER][LOSS] k=%d tid=%s inrl=%.4f ent=%.4f", step_idx, tid, float(loss_in), float(ent_x))
-
-                        # (b) One differentiable inner step θ->φ on head params
-                        grads = torch.autograd.grad(loss_in, tuple(head_theta_named.values()), create_graph=True, allow_unused=True)
-                        phi_head = {}
-                        for (pname, w), g in zip(head_theta_named.items(), grads):
-                            if g is None:
-                                g = torch.zeros_like(w)
-                            phi_head[pname] = w - inner_lr * g
-
-                        # (c) Evaluate BC (and optional outer_pg) at φ
-                        with autocast(device_type="cuda", enabled=use_amp):
-                            phi_params = {**rest_theta_named, **phi_head}
-                            logits_b, _ = _functional_forward(policy_net, phi_params, buffers_named, tensors["batch_obs"])
-                            if args.label_smoothing > 0.0:
-                                loss_bc_k = smoothed_cross_entropy(
-                                    logits_b, tensors["batch_lab"], ignore_index=PAD_ACTION, smoothing=args.label_smoothing
-                                )
-                            else:
-                                ce = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
-                                loss_bc_k = ce(logits_b.reshape(-1, logits_b.size(-1)), tensors["batch_lab"].reshape(-1))
+                    # Also compute BC-after-adapt @θ for logging (not used in grad)
+                    with torch.no_grad():
+                        bc_phi_base = []
+                        inrl_base = 0.0
+                        for tid in tasks_used:
+                            t = per_task_tensors[tid]
+                            # BC after inner adaptation (unperturbed)
+                            bc_phi = meta_objective_from_rollout(policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device)
+                            bc_phi_base.append(float(bc_phi.cpu()))
+                            # small monitor PG at θ
                             if args.outer_pg_coef and args.outer_pg_coef > 0.0:
-                                loss_bc_k = loss_bc_k + outer_pg
-                        loss_bc_list.append(loss_bc_k)
+                                rews = torch.clamp(t["rewards"] * args.rew_scale, -args.rew_clip, args.rew_clip)
+                                pg = _outer_pg_term(policy_net, t["exp"], t["actions"], t["beh_logits"], rews, args)
+                                inrl_base += float(pg.cpu())
+                        if bc_phi_base:
+                            running_bc += float(np.mean(bc_phi_base))
+                            if args.outer_pg_coef and args.outer_pg_coef > 0.0:
+                                running_inrl += inrl_base / max(1, len(tasks_used))
+                            count_updates += 1
 
-                    if len(loss_bc_list) == 0:
-                        continue
-                    total_bc = sum(loss_bc_list) / float(len(loss_bc_list))
-                    avg_loss = total_bc
+                    # Prepare ES named params & grads
+                    named_params = select_es_named_params(policy_net, args.es_scope)
+                    if is_verbose_batch:
+                        logger.info("[ES] scope=%s popsize=%d sigma=%.4f params=%d",
+                                    args.es_scope, int(args.es_popsize), float(args.es_sigma), len(named_params))
 
-                    scaler.scale(avg_loss).backward()
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
-                    if not torch.isfinite(grad_norm):
-                        logger.warning("[GRAD][NONFINITE] grad_norm=%s — skipping optimizer step", str(grad_norm))
-                        optimizer.zero_grad(set_to_none=True)
-                    else:
-                        scaler.step(optimizer)
-                        scaler.update()
+                    es_grads = {n: torch.zeros_like(p) for n, p in named_params.items()}
 
+                    # Population loop (antithetic)
+                    for i in range(int(args.es_popsize)):
+                        eps = sample_eps(named_params, "spsa" if args.es_algo == "spsa" else "es")
+
+                        # Evaluate f(θ + σ ε)
+                        with PerturbContext(named_params, eps, args.es_sigma, +1):
+                            bc_list_plus = []
+                            pg_list_plus = []
+                            for tid in tasks_used:
+                                t = per_task_tensors[tid]
+                                bc_phi = meta_objective_from_rollout(policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device)
+                                bc_list_plus.append(bc_phi)
+                                if args.outer_pg_coef and args.outer_pg_coef > 0.0:
+                                    rews = torch.clamp(t["rewards"] * args.rew_scale, -args.rew_clip, args.rew_clip)
+                                    pg_term = _outer_pg_term(policy_net, t["exp"], t["actions"], t["beh_logits"], rews, args)
+                                    pg_list_plus.append(pg_term)
+
+                            f_plus = torch.stack(bc_list_plus).mean()
+                            if args.outer_pg_coef and args.outer_pg_coef > 0.0 and len(pg_list_plus) > 0:
+                                # Δ gate computed against bc_theta@base (one per task)
+                                deltas = torch.stack([bc_theta_map[tid] - bc for tid, bc in zip(tasks_used, bc_list_minus)])
+                                std = deltas.std(unbiased=False).clamp_min(1e-6)
+                                dnorm = torch.clamp((deltas - deltas.mean()) / std, -2.0, 2.0)
+                                if getattr(args, "delta_gate_relu", False):
+                                    dnorm = torch.relu(dnorm)
+                                pg_terms = torch.stack(pg_list_minus)
+                                f_minus = f_minus + args.outer_pg_coef * (dnorm * pg_terms).mean()
+
+                        # Evaluate f(θ - σ ε)
+                        with PerturbContext(named_params, eps, args.es_sigma, -1):
+                            bc_list_minus = []
+                            pg_list_minus = []
+                            for tid in tasks_used:
+                                t = per_task_tensors[tid]
+                                bc_phi = meta_objective_from_rollout(policy_net, t["ro"], t["batch_obs"], t["batch_lab"], args, device)
+                                bc_list_minus.append(bc_phi)
+                                if args.outer_pg_coef and args.outer_pg_coef > 0.0:
+                                    rews = torch.clamp(t["rewards"] * args.rew_scale, -args.rew_clip, args.rew_clip)
+                                    pg_term = _outer_pg_term(policy_net, t["exp"], t["actions"], t["beh_logits"], rews, args)
+                                    pg_list_minus.append(pg_term)
+
+                            f_minus = torch.stack(bc_list_minus).mean()
+                            if args.outer_pg_coef and args.outer_pg_coef > 0.0 and len(pg_list_minus) > 0:
+                                deltas = torch.stack([bc_theta_map[tid] - bc for tid, bc in zip(tasks_used, bc_list_minus)])
+                                dnorm = (deltas - deltas.mean()) / dnorm.std().clamp_min(1e-6) if (dnorm := deltas.std()) else deltas*0.0  # safe
+                                dnorm = torch.clamp((deltas - deltas.mean()) / deltas.std().clamp_min(1e-6), -2.0, 2.0)
+                                if getattr(args, "delta_gate_relu", False):
+                                    dnorm = torch.relu(dnorm)
+                                pg_terms = torch.stack(pg_list_minus)
+                                f_minus = f_minus + args.outer_pg_coef * (dnorm * pg_terms).mean()
+
+                        coeff = (f_plus - f_minus) / (2.0 * float(args.es_sigma))
+                        # Accumulate grads: g += coeff * ε
+                        for n, p in named_params.items():
+                            es_grads[n] = es_grads[n].add_(coeff * eps[n])
+
+                    # Average over population
+                    for n in es_grads:
+                        es_grads[n].div_(float(args.es_popsize))
+
+                    # Apply gradients via existing optimizer
+                    # (leave grads at 0 for non-selected params)
+                    for group in optimizer.param_groups:
+                        for p in group["params"]:
+                            p.grad = None  # clear to avoid stale grads
+                    for n, p in named_params.items():
+                        p.grad = es_grads[n]
+                    if args.es_clip_grad and args.es_clip_grad > 0:
+                        torch.nn.utils.clip_grad_norm_(list(named_params.values()), args.es_clip_grad)
+                    optimizer.step()
+
+                    # housekeeping
                     for tid in tasks_used:
                         explore_cache[tid].reuse_count += 1
-                    running_bc += float(total_bc.detach().cpu())
-                    running_inrl += inrl_monitor_sum / max(1, len(tasks_used))
-                    count_updates += 1
+                    if device.type == "cuda":
+                        updates_since_free += 1
+                        if updates_since_free >= free_every:
+                            torch.cuda.empty_cache()
+                            updates_since_free = 0
 
-                else:
-                    # ----- PLASTIC inner step -----
-                    loss_bc_list = []
-                    inrl_monitor_sum = 0.0
-                    optimizer.zero_grad(set_to_none=True)
+                    if is_verbose_batch:
+                        msg = f"[ES STEP {step_idx+1}/{args.nbc}] bc(avg)={running_bc/max(1,count_updates):.4f}"
+                        if args.outer_pg_coef and count_updates > 0:
+                            msg += f" inrl(avg)={running_inrl/max(1,count_updates):.4f}"
+                        if debug_mem:
+                            msg += " | " + _cuda_mem("post-es", device)
+                        logger.info(msg)
 
-                    for idx_task, tid in enumerate(tasks_used):
-                        tensors = per_task_tensors[tid]
-                        exp = tensors["exp"]; acts = tensors["actions"]; beh = tensors["beh_logits"]
-                        rews_raw = tensors["rewards"]
-                        rews = torch.clamp(rews_raw * args.rew_scale, -args.rew_clip, args.rew_clip)
+                    continue  # ES branch finished this step
 
-                        Tx_full = exp.shape[0]
-                        if inner_trunc_T is not None and isinstance(inner_trunc_T, int) and exp.shape[0] > inner_trunc_T:
-                            exp = exp[-inner_trunc_T:]; acts = acts[-inner_trunc_T:]; rews = rews[-inner_trunc_T:]; beh  = beh[-inner_trunc_T:]
-                        if is_verbose_batch and idx_task < debug_tasks_per_batch and debug_shapes and step_idx == 0:
-                            logger.debug("[PLASTIC][TRUNC] tid=%s Tx_full=%d Tx_used=%d", tid, Tx_full, exp.shape[0])
+                # ----------- Backprop branch (original) -----------
+                optimizer.zero_grad(set_to_none=True)
 
-                        # pass 1: modulators
-                        with torch.no_grad():
-                            if hasattr(policy_net, "reset_plastic"):
-                                policy_net.reset_plastic(batch_size=1, device=device)
-                                policy_net.set_plastic(update_traces=False, modulators=None)
-                            logits_x, values_x = policy_net(exp.unsqueeze(0))
-                            logits_x = logits_x[0]; values_x = values_x[0]
-                            returns = discounted_returns(rews, args.gamma)
-                            if args.plastic_mod == "reward":
-                                m_t = rews.clone()
-                            elif args.plastic_mod == "td":
-                                boot = torch.cat([values_x[1:], values_x[-1:]])
-                                m_t = (rews + args.gamma * boot - values_x)
-                            elif args.plastic_mod == "const":
-                                m_t = torch.ones_like(rews)
-                            else:  # "adv"
-                                m_t = returns - values_x
-                            std = m_t.std().clamp_min(1e-6)
-                            m_t = (m_t - m_t.mean()) / std
-                            m_t = m_t.clamp(-args.plastic_clip_mod, args.plastic_clip_mod)
+                loss_bc_list = []
+                delta_list = []
+                outer_pg_list = []
+                inrl_monitor_sum = 0.0
 
-                        if is_verbose_batch and debug_inner_per_task and idx_task < debug_tasks_per_batch:
-                            logger.debug("[PLASTIC][MOD] tid=%s mean=%.3f std=%.3f min=%.3f max=%.3f",
-                                         tid, float(m_t.mean()), float(m_t.std()), float(m_t.min()), float(m_t.max()))
+                for idx_task, tid in enumerate(tasks_used):
+                    tensors = per_task_tensors[tid]
+                    exp = tensors["exp"]; acts = tensors["actions"]; beh = tensors["beh_logits"]
+                    rews_raw = tensors["rewards"]
+                    rews = torch.clamp(rews_raw * args.rew_scale, -args.rew_clip, args.rew_clip)
 
-                        # pass 2: adapt traces & monitor RL loss
+                    # (optional) truncate explore window for speed
+                    if args.adapt_trunc_T is not None and isinstance(args.adapt_trunc_T, int) and exp.shape[0] > args.adapt_trunc_T:
+                        exp = exp[-args.adapt_trunc_T:]; acts = acts[-args.adapt_trunc_T:]; rews = rews[-args.adapt_trunc_T:]; beh  = beh[-args.adapt_trunc_T:]
+                    if is_verbose_batch and idx_task < debug_tasks_per_batch and debug_shapes and step_idx == 0:
+                        logger.debug("[PLASTIC][TRUNC] tid=%s Tx_used=%d", tid, exp.shape[0])
+
+                    # ---- pass 0: BC at θ (no plastic) for Δ gate ----
+                    with torch.no_grad():
                         if hasattr(policy_net, "reset_plastic"):
                             policy_net.reset_plastic(batch_size=1, device=device)
-                            policy_net.set_plastic(update_traces=True, modulators=m_t.unsqueeze(0))
-                        logits_x2, values_x2 = policy_net(exp.unsqueeze(0))
-                        with torch.no_grad():
-                            loss_in, ent_x, _ = reinforce_with_baseline(
-                                cur_logits=logits_x2[0], actions=acts, rewards=rews, values=values_x2[0],
-                                gamma=args.gamma, lam=args.gae_lambda, use_gae=args.use_gae,
-                                entropy_coef=args.explore_entropy_coef,
-                                behavior_logits=(beh if args.offpolicy_correction!="none" else None),
-                                offpolicy=args.offpolicy_correction, is_clip_rho=args.is_clip_rho,
-                                normalize_adv=args.adv_norm, value_clip=args.critic_value_clip,
+                            policy_net.set_plastic(update_traces=False, modulators=None)
+                        logits_bc_theta, _ = policy_net(tensors["batch_obs"])
+                        if args.label_smoothing > 0.0:
+                            loss_bc_theta = smoothed_cross_entropy(
+                                logits_bc_theta, tensors["batch_lab"], ignore_index=PAD_ACTION, smoothing=args.label_smoothing
                             )
-                        inrl_monitor_sum += float(loss_in.cpu())
-                        if is_verbose_batch and debug_inner_per_task and idx_task < debug_tasks_per_batch:
-                            logger.debug("[PLASTIC][INNER_LOSS] k=%d tid=%s inrl=%.4f ent=%.4f", step_idx, tid, float(loss_in), float(ent_x))
+                        else:
+                            ce = torch.nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
+                            loss_bc_theta = ce(
+                                logits_bc_theta.reshape(-1, logits_bc_theta.size(-1)),
+                                tensors["batch_lab"].reshape(-1)
+                            )
 
-                        # BC at φ
+                    # ---- pass 1: advantages at θ + modulators ----
+                    if hasattr(policy_net, "reset_plastic"):
+                        policy_net.reset_plastic(batch_size=1, device=device)
                         policy_net.set_plastic(update_traces=False, modulators=None)
-                        with autocast(device_type="cuda", enabled=use_amp):
-                            logits_b, _ = policy_net(tensors["batch_obs"])
-                            if args.label_smoothing > 0.0:
-                                loss_bc_k = smoothed_cross_entropy(logits_b, tensors["batch_lab"], ignore_index=PAD_ACTION, smoothing=args.label_smoothing)
-                            else:
-                                ce = nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
-                                loss_bc_k = ce(logits_b.reshape(-1, logits_b.size(-1)), tensors["batch_lab"].reshape(-1))
-                        loss_bc_list.append(loss_bc_k)
+                    logits_theta, _ = policy_net(exp.unsqueeze(0))  # (1,T,A) with grad
+                    logits_theta = logits_theta[0]
 
-                    if len(loss_bc_list) == 0:
-                        continue
-                    total_bc = sum(loss_bc_list) / float(len(loss_bc_list))
-                    avg_loss = total_bc
+                    returns = discounted_returns(rews, args.gamma)
+                    # per-task linear baseline
+                    T = returns.size(0)
+                    t = torch.arange(T, device=returns.device, dtype=returns.dtype)
+                    zt = (t - t.mean()) / t.std().clamp_min(1e-6)
+                    F = torch.stack([torch.ones_like(zt), zt], dim=1)  # (T,2)
+                    FT_F = F.T @ F + 1e-3 * torch.eye(2, device=returns.device, dtype=returns.dtype)
+                    w = torch.linalg.solve(FT_F, F.T @ returns)
+                    baseline = (F @ w)
 
-                    scaler.scale(avg_loss).backward()
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
-                    if not torch.isfinite(grad_norm):
-                        logger.warning("[PLASTIC][NONFINITE] grad_norm=%s — skipping optimizer step", str(grad_norm))
-                        optimizer.zero_grad(set_to_none=True)
-                    else:
-                        scaler.step(optimizer)
-                        scaler.update()
+                    adv = returns - baseline
+                    adv_norm = (adv - adv.mean()) / adv.std().clamp_min(1e-6)
+                    m_t = adv_norm.clamp(-args.plastic_clip_mod, args.plastic_clip_mod)
 
-                    for tid in tasks_used:
-                        explore_cache[tid].reuse_count += 1
-                    running_bc += float(total_bc.detach().cpu())
-                    running_inrl += inrl_monitor_sum / max(1, len(tasks_used))
-                    count_updates += 1
+                    if is_verbose_batch and debug_inner_per_task and idx_task < debug_tasks_per_batch:
+                        logger.debug("[PLASTIC][MOD] tid=%s mean=%.3f std=%.3f min=%.3f max=%.3f",
+                                     tid, float(m_t.mean()), float(m_t.std()), float(m_t.min()), float(m_t.max()))
+
+                    # ---- pass 2: adapt traces with modulators, then BC at φ ----
+                    if hasattr(policy_net, "reset_plastic"):
+                        policy_net.reset_plastic(batch_size=1, device=device)
+                        policy_net.set_plastic(update_traces=True, modulators=m_t.unsqueeze(0))
+                    _ = policy_net(exp.unsqueeze(0))  # update fast weights
+
+                    policy_net.set_plastic(update_traces=False, modulators=None)
+                    with autocast(device_type="cuda", enabled=use_amp):
+                        logits_phi, _ = policy_net(tensors["batch_obs"])
+                        if args.label_smoothing > 0.0:
+                            loss_bc_phi = smoothed_cross_entropy(logits_phi, tensors["batch_lab"], ignore_index=PAD_ACTION, smoothing=args.label_smoothing)
+                        else:
+                            ce = torch.nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
+                            loss_bc_phi = ce(logits_phi.reshape(-1, logits_phi.size(-1)), tensors["batch_lab"].reshape(-1))
+                    loss_bc_list.append(loss_bc_phi)
+
+                    # Δ gate: positive => adaptation helped demos
+                    delta_k = (loss_bc_theta.detach() - loss_bc_phi.detach())
+                    delta_list.append(delta_k)
+
+                    # Outer PG at θ with plain IS, weight applied later by Δ
+                    logp_cur = torch.log_softmax(logits_theta, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+                    with torch.no_grad():
+                        logp_beh = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+                        rho = torch.exp(logp_cur.detach() - logp_beh)
+                        if args.is_clip_rho and args.is_clip_rho > 0:
+                            rho = torch.clamp(rho, max=args.is_clip_rho)
+                    outer_pg_k = - (rho * logp_cur * adv_norm.detach()).mean()
+                    outer_pg_list.append(outer_pg_k)
+
+                    with torch.no_grad():
+                        monitor_pg = - (logp_cur.detach() * adv_norm).mean()
+                        inrl_monitor_sum += float(monitor_pg.detach().cpu())
+
+                if len(loss_bc_list) == 0:
+                    continue
+
+                total_bc = sum(loss_bc_list) / float(len(loss_bc_list))
+                outer_pg = torch.tensor(0.0, device=device)
+                if getattr(args, "outer_pg_coef", 0.0) > 0.0:
+                    deltas = torch.stack(delta_list)
+                    dnorm = (deltas - deltas.mean()) / deltas.std().clamp_min(1e-6)
+                    dnorm = torch.clamp(dnorm, -2.0, 2.0)
+                    if getattr(args, "delta_gate_relu", False):
+                        dnorm = torch.relu(dnorm)
+                    pg_terms = torch.stack(outer_pg_list)
+                    outer_pg = (dnorm * pg_terms).mean()
+
+                avg_loss = total_bc + getattr(args, "outer_pg_coef", 0.0) * outer_pg
+
+                # Safe AMP step
+                scaler.scale(avg_loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
+                if not torch.isfinite(grad_norm):
+                    logger.warning("[PLASTIC][NONFINITE] grad_norm=%s — skipping optimizer step", str(grad_norm))
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                for tid in tasks_used:
+                    explore_cache[tid].reuse_count += 1
+                running_bc += float(total_bc.detach().cpu())
+                running_inrl += inrl_monitor_sum / max(1, len(tasks_used))
+                count_updates += 1
 
                 if device.type == "cuda":
                     updates_since_free += 1
@@ -1008,11 +803,9 @@ def run_training():
                         updates_since_free = 0
 
                 if is_verbose_batch:
-                    msg = f"[STEP {step_idx+1}/{nbc}] mode={inner_mode} avg_bc={float(total_bc):.4f} inrl@theta(avg)={running_inrl/max(1,count_updates):.4f}"
+                    msg = f"[STEP {step_idx+1}/{args.nbc}] avg_bc={float(total_bc):.4f} inrl@theta(avg)={running_inrl/max(1,count_updates):.4f}"
                     if debug_mem:
                         msg += " | " + _cuda_mem("post-step", device)
-                    if debug_timing and ktimer is not None:
-                        msg += f" | step_time={ktimer():.3f}s"
                     logger.info(msg)
 
             per_task_tensors.clear()
@@ -1025,18 +818,12 @@ def run_training():
                     inrl=f"{running_inrl/max(1,count_updates):.3f}"
                 )
 
-            if is_verbose_batch and debug_timing and btimer is not None:
-                logger.info("[BATCH %d] elapsed=%.3fs", b+1, btimer())
-
         # ------- Validation -------
         policy_net.eval()
         with torch.no_grad():
-            vtimer = _timer() if debug_timing else None
             (val_results, avg_p1, avg_p2, std_p1, std_p2, avg_total, success_rate) = eval_sampled_val(
-                policy_net, val_tasks, _make_base_env(), device, sample_n=args.val_sample_size
+                policy_net, val_tasks, make_base_env(), device, sample_n=args.val_sample_size
             )
-            if debug and debug_timing and vtimer is not None:
-                logger.info("[VAL] elapsed=%.3fs", vtimer())
 
         logger.info(
             f"[Epoch {epoch:02d}] bc_outer={running_bc/max(1,count_updates):.4f} "
@@ -1062,7 +849,7 @@ def run_training():
             logger.info(f"[EARLY STOP] no improvement for {patience} epochs, stopping.")
             break
 
-    logger.info("BC meta training complete (inner_mode=%s).", inner_mode)
+    logger.info("BC meta training complete.")
 
 if __name__ == "__main__":
     run_training()

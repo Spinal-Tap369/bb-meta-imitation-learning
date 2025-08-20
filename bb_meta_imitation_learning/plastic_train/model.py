@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 class SNAILWithOptionalPlastic(torch.nn.Module):
     """
-    Wraps SNAILPolicyValueNet and optionally replaces the policy head
-    with a plastic head (Linear or Conv1d(1x1), depending on what SNAIL uses).
+    Wrap SNAILPolicyValueNet and replace the policy head with a plastic head
+    (Linear or Conv1d(1x1), depending on what SNAIL uses) when enabled.
     """
     def __init__(self, *, use_plastic_head: bool, plastic_rule: str, plastic_init_eta: float,
                  plastic_learn_eta: bool, **snail_kwargs):
@@ -26,7 +26,6 @@ class SNAILWithOptionalPlastic(torch.nn.Module):
                 raise AttributeError("SNAILPolicyValueNet must expose .policy_head for plastic replacement.")
             ph = self.core.policy_head
 
-            # --- Conv1d(k=1) head (your current SNAIL) ---
             if isinstance(ph, nn.Conv1d):
                 if ph.kernel_size != (1,):
                     raise ValueError("Plastic head supports Conv1d with kernel_size=1 only.")
@@ -39,14 +38,12 @@ class SNAILWithOptionalPlastic(torch.nn.Module):
                     rule=plastic_rule,
                     bias=(ph.bias is not None),
                 )
-                # copy weights/bias (squeeze the 1x1 kernel to matrix)
                 with torch.no_grad():
                     plastic.W.copy_(ph.weight.squeeze(-1))
                     if ph.bias is not None and plastic.bias is not None:
                         plastic.bias.copy_(ph.bias)
                 self.core.policy_head = plastic
 
-            # --- Linear head (if you ever switch) ---
             elif isinstance(ph, nn.Linear):
                 plastic = PlasticLinear(
                     ph.in_features, ph.out_features,
@@ -63,23 +60,21 @@ class SNAILWithOptionalPlastic(torch.nn.Module):
             else:
                 raise TypeError(f"Unsupported policy_head type: {type(ph).__name__} (expected Conv1d(k=1) or Linear)")
 
-    # --- Plastic control proxies ---
+    # Plastic control proxies
     def reset_plastic(self, batch_size: int, device=None):
         if self.use_plastic:
             self.core.policy_head.reset_traces(batch_size, device=device)
 
     def set_plastic(self, *, update_traces: bool, modulators: torch.Tensor | None):
         if self.use_plastic:
-            # WARNING: keep modulators detached (you already do this in train.py)
             m = None if modulators is None else modulators.detach()
             self.core.policy_head.set_mode(update_traces=update_traces, modulators=m)
 
-    # --- Model API passthrough ---
+    # Model API passthrough
     def forward(self, seq):
         return self.core(seq)
 
     def act_single_step(self, seq_prefix):
-        # default: do NOT update traces during eval act unless caller enabled updates
         return self.core.act_single_step(seq_prefix)
 
 def build_model(
@@ -90,7 +85,7 @@ def build_model(
     policy_attn_dim=16,
     value_filters=16,
     seq_len=500,
-    use_plastic_head=False,
+    use_plastic_head=True,
     plastic_rule="oja",
     plastic_init_eta=0.1,
     plastic_learn_eta=False,
