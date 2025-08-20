@@ -42,7 +42,7 @@ from .es import (
     sample_eps,
     PerturbContext,
     meta_objective_from_rollout,
-    meta_objective_with_inner_pg,  # <-- new helper import
+    meta_objective_with_inner_pg,  # inner RL + post-adapt BC
 )
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,6 @@ logger = logging.getLogger(__name__)
 def _setup_logging(log_file: Optional[str], level: str):
     """Set up root logger to both stdout and an optional file."""
     root = logging.getLogger()
-    # Clear preexisting handlers to avoid duplicates (e.g., in notebooks)
     for h in list(root.handlers):
         root.removeHandler(h)
 
@@ -162,6 +161,14 @@ def _outer_pg_term(policy_net: nn.Module,
     return ( - (rho * logp_cur * adv_norm).mean() ).detach()
 
 
+# ---------- util: concise ID printing ----------
+def _fmt_ids(ids: List[int], limit: int = 8) -> str:
+    ids = list(ids)
+    if len(ids) <= limit:
+        return "[" + ",".join(str(x) for x in ids) + "]"
+    return "[" + ",".join(str(x) for x in ids[:limit]) + ",...;n=" + str(len(ids)) + "]"
+
+
 # ---------- vectorized recollect helper ----------
 def _recollect_batch_for_sign(
     policy_net: nn.Module,
@@ -173,6 +180,9 @@ def _recollect_batch_for_sign(
     dbg: bool = False,
     dbg_timing: bool = False,
     dbg_level: str = "WARNING",
+    # new: force INFO logging for ES inner recollects (even if not in DEBUG)
+    log_info: bool = False,
+    sign_label: str = "",
 ) -> Dict[int, ExploreRollout]:
     """
     Recollect phase-1 rollouts for a set of tasks using vectorized envs.
@@ -192,12 +202,20 @@ def _recollect_batch_for_sign(
 
     for off in range(0, len(all_cfgs), step):
         cfgs = all_cfgs[off: off + step]
+        slice_tids = tasks_used[off: off + step]
+
+        if log_info:
+            logger.info(
+                "[COLLECT][ES%s] chunk=%d..%d/%d vec_cap=%d seed_base=%d tasks=%s",
+                sign_label, off, off + len(cfgs) - 1, len(all_cfgs) - 1, step, seed_base + off, _fmt_ids(slice_tids)
+            )
+
         ro_list = collect_explore_vec(
             policy_net, cfgs, device, max_steps=250,
             seed_base=seed_base + off,
             dbg=dbg, dbg_timing=dbg_timing, dbg_level=dbg_level
         )
-        slice_tids = tasks_used[off: off + step]
+
         for tid, ro in zip(slice_tids, ro_list):
             ros_by_tid[tid] = ro
 
@@ -214,7 +232,7 @@ def run_training():
     chosen_level = (args.log_level or args.debug_level or ("DEBUG" if args.debug else "INFO")).upper()
     _setup_logging(log_file=args.log_file, level=chosen_level)
 
-    # Debug flags (still control *what* we log; level controls verbosity)
+    # Debug flags (control *what* we log; chosen_level controls verbosity)
     debug = bool(getattr(args, "debug", False))
     debug_level = str(getattr(args, "debug_level", "INFO")).upper()
     debug_every_batches = int(getattr(args, "debug_every_batches", 1))
@@ -392,17 +410,18 @@ def run_training():
 
         pbar = tqdm(range(num_batches), desc=f"[Epoch {epoch:02d}] train", leave=False, disable=getattr(args, "no_tqdm", False))
         for b in pbar:
-            is_verbose_batch = debug and ((b % max(1, debug_every_batches)) == 0)
-            # Only show heavy per-task chatter at DEBUG
-            is_task_verbose = is_verbose_batch and (debug_level == "DEBUG")
+            # Only show per-task chatter at DEBUG
+            is_debug_batch = debug and ((b % max(1, debug_every_batches)) == 0)
+            is_task_verbose = is_debug_batch and (debug_level == "DEBUG")
 
             start = b * args.batch_size
             end = min(len(train_tasks), (b + 1) * args.batch_size)
             batch_ids = [batch_indices[i] for i in range(start, end)]
             batch_tasks = [train_tasks[i] for i in batch_ids]
-            if is_verbose_batch:
+
+            if is_task_verbose:
                 tids = [t["task_id"] for t in batch_tasks]
-                logger.info("[BATCH %d/%d] tasks=%s", b+1, num_batches, tids)
+                logger.info("[BATCH %d/%d] tasks=%s", b+1, num_batches, _fmt_ids(tids))
                 if debug_mem:
                     logger.info("[MEM][BATCH-START] %s", _cuda_mem("batch-start", device))
 
@@ -412,16 +431,26 @@ def run_training():
                 tid = task["task_id"]
                 if tid not in explore_cache or explore_cache[tid].reuse_count >= args.explore_reuse_M:
                     need_collect.append(task)
+
             _vec_cap = int(getattr(args, "num_envs", 8))
-            if is_task_verbose:
-                logger.info("[COLLECT] need_collect=%d vec_cap=%d", len(need_collect), _vec_cap)
+            if need_collect:
+                logger.info("[COLLECT][BASE] epoch=%d batch=%d vec_cap=%d seed_base=%d tasks=%s",
+                            epoch, b+1, _vec_cap,
+                            args.seed + 100000 * epoch + 1000 * b,
+                            _fmt_ids([t["task_id"] for t in need_collect]))
 
             for off in range(0, len(need_collect), max(1, _vec_cap)):
                 slice_tasks = need_collect[off: off + max(1, _vec_cap)]
                 cfgs = [MazeTaskManager.TaskConfig(**t["task_dict"]) for t in slice_tasks]
+                seed_here = args.seed + 100000 * epoch + 1000 * b + off
+
+                if slice_tasks:
+                    logger.info("[COLLECT][BASE] chunk off=%d n=%d seed=%d tasks=%s",
+                                off, len(slice_tasks), seed_here, _fmt_ids([t["task_id"] for t in slice_tasks]))
+
                 ro_list = collect_explore_vec(
                     policy_net, cfgs, device, max_steps=250,
-                    seed_base=args.seed + 100000 * epoch + 1000 * b + off,
+                    seed_base=seed_here,
                     dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
                 )
                 for ttask, ro in zip(slice_tasks, ro_list):
@@ -440,9 +469,11 @@ def run_training():
                 cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
                 ro = explore_cache.get(tid, None)
                 if ro is None:
+                    seed_here = args.seed + 424242
+                    logger.info("[COLLECT][BASE-MISS] tid=%s seed=%d", tid, seed_here)
                     ro = collect_explore_vec(
                         policy_net, [cfg], device, max_steps=250,
-                        seed_base=args.seed + 424242,
+                        seed_base=seed_here,
                         dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
                     ).pop()
                     explore_cache[tid] = ro
@@ -461,9 +492,11 @@ def run_training():
                 if is_task_verbose:
                     logger.info("[KL] tid=%s mean_kl=%.4f thr=%.4f", tid, kl_val, args.kl_refresh_threshold)
                 if kl_val > args.kl_refresh_threshold:
+                    seed_here = args.seed + 999999
+                    logger.info("[COLLECT][KL-REFRESH] tid=%s seed=%d (kl=%.4f > %.4f)", tid, seed_here, kl_val, args.kl_refresh_threshold)
                     ro = collect_explore_vec(
                         policy_net, [cfg], device, max_steps=250,
-                        seed_base=args.seed + 999999,
+                        seed_base=seed_here,
                         dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
                     ).pop()
                     explore_cache[tid] = ro
@@ -472,8 +505,7 @@ def run_training():
                     rewards_x    = ro.rewards.to(device, non_blocking=True)
                     beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
                     Tx = exp_six_dev.shape[0]
-                    if is_task_verbose:
-                        logger.info("[KL][REFRESH] tid=%s new_Tx=%d", tid, Tx)
+                    logger.info("[KL][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
                 # ESS guard (optional)
                 if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
@@ -488,9 +520,12 @@ def run_training():
                         logger.info("[ESS] tid=%s Tx=%d ess_ratio=%.3f thr=%.3f reuse_count=%d",
                                     tid, Tx, ess_ratio, args.ess_refresh_ratio, ro.reuse_count)
                     if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio < args.ess_refresh_ratio:
+                        seed_here = args.seed + 31337
+                        logger.info("[COLLECT][ESS-REFRESH] tid=%s seed=%d (ess=%.3f < %.3f)",
+                                    tid, seed_here, ess_ratio, args.ess_refresh_ratio)
                         ro = collect_explore_vec(
                             policy_net, [cfg], device, max_steps=250,
-                            seed_base=args.seed + 31337,
+                            seed_base=seed_here,
                             dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
                         ).pop()
                         explore_cache[tid] = ro
@@ -499,8 +534,7 @@ def run_training():
                         rewards_x    = ro.rewards.to(device, non_blocking=True)
                         beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
                         Tx = exp_six_dev.shape[0]
-                        if is_task_verbose:
-                            logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
+                        logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
                 # Build batched BC tensors from ALL demos (once)
                 prev_action_start = float(actions_x[-1].item()) if Tx > 0 else 0.0
@@ -666,10 +700,12 @@ def run_training():
                             ros_plus_by_tid: Dict[int, ExploreRollout] = {}
                             if getattr(args, "es_recollect_inner", False):
                                 seed_for_pair = (pair_seed if pair_seed is not None else args.seed + 99991 + i)
+                                # Force INFO logs for trajectory collection
                                 ros_plus_by_tid = _recollect_batch_for_sign(
                                     policy_net, per_task_tensors, tasks_used, device,
                                     seed_base=seed_for_pair, vec_cap=vec_cap,
-                                    dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
+                                    dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level,
+                                    log_info=True, sign_label="+"
                                 )
 
                             for tid in tasks_used:
@@ -717,10 +753,12 @@ def run_training():
                             ros_minus_by_tid: Dict[int, ExploreRollout] = {}
                             if getattr(args, "es_recollect_inner", False):
                                 seed_for_pair = (pair_seed if pair_seed is not None else args.seed + 99991 + i)
+                                # Force INFO logs for trajectory collection
                                 ros_minus_by_tid = _recollect_batch_for_sign(
                                     policy_net, per_task_tensors, tasks_used, device,
                                     seed_base=seed_for_pair, vec_cap=vec_cap,
-                                    dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level
+                                    dbg=is_task_verbose, dbg_timing=(debug_timing and is_task_verbose), dbg_level=debug_level,
+                                    log_info=True, sign_label="-"
                                 )
 
                             for tid in tasks_used:
