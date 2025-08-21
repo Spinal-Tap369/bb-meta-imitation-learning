@@ -128,5 +128,13 @@ def parse_args():
     p.add_argument("--es_inner_pg_scope", type=str, default="head", choices=["head", "policy"], help="Which params to update in the inner PG step.")
     p.add_argument("--es_inner_pg_use_is", action="store_true", help="Apply IS weights rho_t in the inner PG loss when reusing behavior data.")
 
-
+    # inside parse_args()
+    p.add_argument("--syn_demo_root", type=str, default=None,
+                help="Optional second demo root for synthetic demos (same layout as main).")
+    p.add_argument("--syn_demo_min_epoch", type=int, default=3,
+                help="Begin including synthetic demos at this (1-indexed) epoch.")
+    p.add_argument("--max_main_demos_per_task", type=int, default=3,
+                help="Max number of main demos per task to use.")
+    p.add_argument("--max_syn_demos_per_task", type=int, default=20,
+                help="Max number of synthetic demos per task to use once enabled.")
     return p.parse_args()
