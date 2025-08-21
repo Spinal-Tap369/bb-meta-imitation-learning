@@ -91,6 +91,43 @@ def _count_params(mod: nn.Module):
     return tot, train
 
 
+# ---------- indicator helpers ----------
+def _stats_from_list(vals):
+    if not vals:
+        return dict(n=0, mean=float("nan"), std=float("nan"), min=float("nan"), max=float("nan"))
+    t = torch.tensor(vals, dtype=torch.float32)
+    return dict(
+        n=len(vals),
+        mean=float(t.mean()),
+        std=float(t.std(unbiased=False)),
+        min=float(t.min()),
+        max=float(t.max()),
+    )
+
+
+def _fmt_stats(name, s):
+    if name:
+        prefix = f"{name}:"
+    else:
+        prefix = ""
+    return (
+        f"{prefix}n={s['n']} mean={s['mean']:.4f} std={s['std']:.4f} "
+        f"min={s['min']:.4f} max={s['max']:.4f}"
+    )
+
+
+def _frac_clipped(x: torch.Tensor, clip: float):
+    if clip is None or clip <= 0:
+        return 0.0
+    return float((x > clip).float().mean().item())
+
+
+def _frac_at_clip_abs(x: torch.Tensor, clip: float, eps: float = 1e-6):
+    if clip is None or clip <= 0:
+        return 0.0
+    return float((x.abs() >= (clip - eps)).float().mean().item())
+
+
 # ---------- optimizer helpers ----------
 def _find_encoder_module(net: torch.nn.Module):
     cand = ["image_encoder", "cnn", "conv_frontend", "visual_encoder", "encoder", "backbone", "combined_encoder"]
@@ -464,6 +501,17 @@ def run_training():
             per_task_tensors: Dict[int, Dict[str, torch.Tensor]] = {}
             tasks_used: List[int] = []
 
+            # --- INDICATORS holders for this batch ---
+            batch_kl_vals = []
+            batch_ess_vals = []
+            batch_rho_mean = []
+            batch_rho_std  = []
+            batch_rho_max  = []
+            batch_rho_clip_frac = []
+            batch_reuse_counts = []
+            kl_refresh_count = 0
+            ess_refresh_count = 0
+
             for idx_task, task in enumerate(batch_tasks):
                 tid = task["task_id"]
                 cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
@@ -484,14 +532,33 @@ def run_training():
                 beh_logits_x = ro.beh_logits.to(device, non_blocking=True)
                 Tx = exp_six_dev.shape[0]
 
-                # KL refresh guard
+                # KL refresh guard (+ IS stats computed once regardless of ESS refresh setting)
                 with torch.no_grad():
                     logits_now_tmp, _ = policy_net(exp_six_dev.unsqueeze(0))
                     logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
                     kl_val = mean_kl_logits(logits_now_tmp, beh_logits_x).item()
+
+                    # IS weights & ESS (always compute for diagnostics)
+                    lp_cur = torch.log_softmax(logits_now_tmp, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
+                    lp_beh = torch.log_softmax(beh_logits_x, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
+                    rhos = torch.exp(lp_cur - lp_beh)
+                    ess_ratio_val = ess_ratio_from_rhos(rhos).item()
+
+                batch_kl_vals.append(kl_val)
+                batch_ess_vals.append(ess_ratio_val)
+                batch_rho_mean.append(float(rhos.mean().item()))
+                batch_rho_std.append(float(rhos.std(unbiased=False).item()))
+                batch_rho_max.append(float(rhos.max().item()))
+                if args.is_clip_rho and args.is_clip_rho > 0:
+                    batch_rho_clip_frac.append(_frac_clipped(rhos, args.is_clip_rho))
+                else:
+                    batch_rho_clip_frac.append(0.0)
+                batch_reuse_counts.append(explore_cache[tid].reuse_count if tid in explore_cache else 0)
+
                 if is_task_verbose:
                     logger.info("[KL] tid=%s mean_kl=%.4f thr=%.4f", tid, kl_val, args.kl_refresh_threshold)
                 if kl_val > args.kl_refresh_threshold:
+                    kl_refresh_count += 1
                     seed_here = args.seed + 999999
                     logger.info("[COLLECT][KL-REFRESH] tid=%s seed=%d (kl=%.4f > %.4f)", tid, seed_here, kl_val, args.kl_refresh_threshold)
                     ro = collect_explore_vec(
@@ -507,22 +574,25 @@ def run_training():
                     Tx = exp_six_dev.shape[0]
                     logger.info("[KL][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
-                # ESS guard (optional)
-                if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
+                    # recompute diagnostics after refresh
                     with torch.no_grad():
-                        logits_now, _ = policy_net(exp_six_dev.unsqueeze(0))
-                        logits_now = logits_now[0] if logits_now.dim() == 3 else logits_now
-                        lp_cur = torch.log_softmax(logits_now, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
+                        logits_now_tmp, _ = policy_net(exp_six_dev.unsqueeze(0))
+                        logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
+                        lp_cur = torch.log_softmax(logits_now_tmp, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
                         lp_beh = torch.log_softmax(beh_logits_x, dim=-1).gather(1, actions_x.unsqueeze(1)).squeeze(1)
                         rhos = torch.exp(lp_cur - lp_beh)
-                        ess_ratio = ess_ratio_from_rhos(rhos).item()
+                        ess_ratio_val = ess_ratio_from_rhos(rhos).item()
+
+                # ESS guard (optional refresh action, diagnostics already collected)
+                if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
                     if is_task_verbose:
                         logger.info("[ESS] tid=%s Tx=%d ess_ratio=%.3f thr=%.3f reuse_count=%d",
-                                    tid, Tx, ess_ratio, args.ess_refresh_ratio, ro.reuse_count)
-                    if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio < args.ess_refresh_ratio:
+                                    tid, Tx, ess_ratio_val, args.ess_refresh_ratio, ro.reuse_count)
+                    if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio_val < args.ess_refresh_ratio:
+                        ess_refresh_count += 1
                         seed_here = args.seed + 31337
                         logger.info("[COLLECT][ESS-REFRESH] tid=%s seed=%d (ess=%.3f < %.3f)",
-                                    tid, seed_here, ess_ratio, args.ess_refresh_ratio)
+                                    tid, seed_here, ess_ratio_val, args.ess_refresh_ratio)
                         ro = collect_explore_vec(
                             policy_net, [cfg], device, max_steps=250,
                             seed_base=seed_here,
@@ -595,8 +665,24 @@ def run_training():
             if len(tasks_used) == 0:
                 continue
 
-            if is_task_verbose and debug_mem:
-                logger.info("[MEM][PRE-K] %s", _cuda_mem("pre-k", device))
+            # ---- Batch indicator summary (INFO) ----
+            s_kl  = _stats_from_list(batch_kl_vals)
+            s_ess = _stats_from_list(batch_ess_vals)
+            s_rmu = _stats_from_list(batch_rho_mean)
+            s_rsd = _stats_from_list(batch_rho_std)
+            s_rmx = _stats_from_list(batch_rho_max)
+            s_rcl = _stats_from_list(batch_rho_clip_frac)
+            s_reu = _stats_from_list(batch_reuse_counts)
+
+            logger.info(
+                "[IND][BATCH %d/%d] tasks=%d | %s | thr=%.3g refresh=%d | ESS:%s thr=%.3g refresh=%d | "
+                "rho(mean):%s rho(std):%s rho(max):%s rho(clip%%):%s | reuse:%s",
+                b+1, num_batches, len(tasks_used),
+                _fmt_stats("KL", s_kl), float(args.kl_refresh_threshold), kl_refresh_count,
+                _fmt_stats("", s_ess), float(args.ess_refresh_ratio), ess_refresh_count,
+                _fmt_stats("", s_rmu), _fmt_stats("", s_rsd), _fmt_stats("", s_rmx),
+                _fmt_stats("", s_rcl), _fmt_stats("", s_reu),
+            )
 
             # -------- Critic auxiliary regression (optional) --------
             if opt_critic is not None and args.critic_aux_steps > 0:
@@ -686,6 +772,9 @@ def run_training():
 
                     es_grads = {n: torch.zeros_like(p) for n, p in named_params.items()}
                     vec_cap = int(getattr(args, "num_envs", 8))  # capacity for vectorized recollects
+
+                    # population diagnostics
+                    pop_fplus, pop_fminus, pop_coeffs = [], [], []
 
                     # Population loop (antithetic)
                     for i in range(int(getattr(args, "es_popsize", 8))):
@@ -804,6 +893,11 @@ def run_training():
                             coeff = ((f_plus - f_theta_baseline) - (f_minus - f_theta_baseline)) / (2.0 * float(getattr(args, "es_sigma", 0.02)))
                         else:
                             coeff = (f_plus - f_minus) / (2.0 * float(getattr(args, "es_sigma", 0.02)))
+
+                        pop_fplus.append(float(f_plus.detach().item()))
+                        pop_fminus.append(float(f_minus.detach().item()))
+                        pop_coeffs.append(float(coeff.detach().item()))
+
                         for n, p in named_params.items():
                             es_grads[n] = es_grads[n].add_(coeff * eps[n])
 
@@ -819,6 +913,15 @@ def run_training():
                         p.grad = es_grads[n]
                     if getattr(args, "es_clip_grad", 0.0) and getattr(args, "es_clip_grad", 0.0) > 0:
                         torch.nn.utils.clip_grad_norm_(list(named_params.values()), getattr(args, "es_clip_grad", 1.0))
+
+                    # ES grad norm (diagnostic)
+                    with torch.no_grad():
+                        es_grad_sq = 0.0
+                        for n, p in named_params.items():
+                            if p.grad is not None:
+                                es_grad_sq += float((p.grad.detach() ** 2).sum().item())
+                        es_grad_norm = math.sqrt(es_grad_sq) if es_grad_sq > 0 else 0.0
+
                     optimizer.step()
 
                     # housekeeping
@@ -830,11 +933,25 @@ def run_training():
                             torch.cuda.empty_cache()
                             updates_since_free = 0
 
-                    if log_every_step or is_task_verbose:
-                        msg = f"[ES STEP {step_idx+1}/{args.nbc}] bc(avg)={running_bc/max(1,count_updates):.4f}"
-                        if debug_mem:
-                            msg += " | " + _cuda_mem("post-es", device)
-                        logger.info(msg)
+                    # ES step diagnostics
+                    s_fp = _stats_from_list(pop_fplus)
+                    s_fm = _stats_from_list(pop_fminus)
+                    s_cf = _stats_from_list(pop_coeffs)
+                    logger.info(
+                        "[ES][STEP %d/%d] pop=%d σ=%.3f scope=%s inner_pg(alpha=%.3g,scope=%s,use_is=%s,recollect=%s) | "
+                        "f+:%s | f-:%s | coeff:%s | grad_norm=%.3e | bc_base=%.4f",
+                        step_idx+1, args.nbc,
+                        int(getattr(args, 'es_popsize', 8)),
+                        float(getattr(args, 'es_sigma', 0.02)),
+                        str(getattr(args, 'es_scope', 'policy')),
+                        float(getattr(args, 'es_inner_pg_alpha', 0.0)),
+                        str(getattr(args, 'es_inner_pg_scope', 'head')),
+                        str(inner_use_is),
+                        str(bool(getattr(args, 'es_recollect_inner', False))),
+                        _fmt_stats("", s_fp), _fmt_stats("", s_fm), _fmt_stats("", s_cf),
+                        es_grad_norm,
+                        f_theta_baseline,
+                    )
 
                     continue  # ES branch finished this step
 
@@ -844,6 +961,10 @@ def run_training():
                 loss_bc_list = []
                 delta_list = []
                 inrl_monitor_sum = 0.0
+
+                # plastic diagnostics
+                mod_mean, mod_std, mod_min, mod_max, mod_clip_frac = [], [], [], [], []
+                delta_vals, delta_pos_count = [], 0
 
                 for idx_task, tid in enumerate(tasks_used):
                     tensors = per_task_tensors[tid]
@@ -908,6 +1029,13 @@ def run_training():
                         logger.debug("[PLASTIC][MOD] tid=%s mean=%.3f std=%.3f min=%.3f max=%.3f",
                                      tid, float(m_t.mean()), float(m_t.std()), float(m_t.min()), float(m_t.max()))
 
+                    # collect modulator stats
+                    mod_mean.append(float(m_t.mean().item()))
+                    mod_std.append(float(m_t.std(unbiased=False).item()))
+                    mod_min.append(float(m_t.min().item()))
+                    mod_max.append(float(m_t.max().item()))
+                    mod_clip_frac.append(_frac_at_clip_abs(m_t, getattr(args, "plastic_clip_mod", 0.0)))
+
                     # ---- pass 2: adapt traces with modulators, then BC at φ ----
                     if hasattr(policy_net, "reset_plastic"):
                         policy_net.reset_plastic(batch_size=1, device=device)
@@ -927,6 +1055,8 @@ def run_training():
                     # Δ gate: positive => adaptation helped demos (for logging/optional weighting)
                     delta_k = (loss_bc_theta.detach() - loss_bc_phi.detach())
                     delta_list.append(delta_k)
+                    delta_vals.append(float(delta_k.item()))
+                    delta_pos_count += int(delta_k.item() > 0.0)
 
                     # Monitor-only PG at θ (no IS weight here for monitoring stat)
                     with torch.no_grad():
@@ -975,12 +1105,24 @@ def run_training():
                         torch.cuda.empty_cache()
                         updates_since_free = 0
 
-                # Only spam step logs at DEBUG (unless --log_every_step is set)
-                if log_every_step or is_task_verbose:
-                    msg = f"[STEP {step_idx+1}/{args.nbc}] avg_bc={float(total_bc):.4f} inrl@theta(avg)={running_inrl/max(1,count_updates):.4f}"
-                    if debug_mem:
-                        msg += " | " + _cuda_mem("post-step", device)
-                    logger.info(msg)
+                # Plastic step diagnostics
+                s_mod_mean = _stats_from_list(mod_mean)
+                s_mod_std  = _stats_from_list(mod_std)
+                s_mod_min  = _stats_from_list(mod_min)
+                s_mod_max  = _stats_from_list(mod_max)
+                s_mod_clip = _stats_from_list(mod_clip_frac)
+                s_delta    = _stats_from_list(delta_vals)
+                frac_pos   = (delta_pos_count / max(1, len(delta_vals)))
+
+                logger.info(
+                    "[IND][PLASTIC STEP %d/%d] ΔBC:%s (frac>0=%.2f) | m_t: mean:%s std:%s min:%s max:%s clip%%:%s | grad_norm=%.3e",
+                    step_idx+1, args.nbc,
+                    _fmt_stats("", s_delta), frac_pos,
+                    _fmt_stats("", s_mod_mean), _fmt_stats("", s_mod_std),
+                    _fmt_stats("", s_mod_min),  _fmt_stats("", s_mod_max),
+                    _fmt_stats("", s_mod_clip),
+                    float(grad_norm if torch.is_tensor(grad_norm) else grad_norm),
+                )
 
             per_task_tensors.clear()
             if device.type == "cuda":
