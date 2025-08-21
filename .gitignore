@@ -39,3 +39,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+train_debug.txt
+collect_expert.py
+syn_train_demos/
+bc_demos_expert/

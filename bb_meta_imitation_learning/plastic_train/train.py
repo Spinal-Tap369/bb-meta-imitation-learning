@@ -151,6 +151,37 @@ def _critic_param_names(net: nn.Module):
             names.append(n)
     return set(names)
 
+def _select_demo_paths_for_task(recs_main, recs_syn, args, epoch: int):
+    """
+    Build a list of absolute demo file paths for this task for the given epoch:
+      - Up to max_main_demos_per_task from main root
+      - If epoch >= syn_demo_min_epoch, up to max_syn_demos_per_task from syn root
+    Selection is shuffled each time this function is called (so batches differ).
+    """
+    paths = []
+
+    # main demos
+    if recs_main and getattr(args, "max_main_demos_per_task", 0) > 0:
+        try:
+            main_paths = first_demo_paths(recs_main, args.demo_root)
+        except TypeError:
+            # Backward-compat: older first_demo_paths signature may not need demo_root
+            main_paths = first_demo_paths(recs_main)
+        random.shuffle(main_paths)
+        paths.extend(main_paths[: int(args.max_main_demos_per_task)])
+
+    # synthetic demos (gated by epoch)
+    use_syn = bool(getattr(args, "syn_demo_root", None)) and (epoch >= int(getattr(args, "syn_demo_min_epoch", 3)))
+    if use_syn and recs_syn and getattr(args, "max_syn_demos_per_task", 0) > 0:
+        try:
+            syn_paths = first_demo_paths(recs_syn, args.syn_demo_root)
+        except TypeError:
+            syn_paths = first_demo_paths(recs_syn)
+        random.shuffle(syn_paths)
+        paths.extend(syn_paths[: int(args.max_syn_demos_per_task)])
+
+    return paths
+
 
 # ---------- small helpers used in both paths ----------
 @torch.no_grad()
@@ -302,36 +333,65 @@ def run_training():
     task_hash_to_dict = {make_task_id(t): t for t in tasks_all}
     logger.info("[DATA] loaded train_trials=%s num_tasks=%d", args.train_trials, len(tasks_all))
 
-    # Load demo manifests
-    demos_by_task = load_all_manifests(args.demo_root)
-    if not demos_by_task:
+    # Load demo manifests: main + optional synthetic
+    demos_by_task_main = load_all_manifests(args.demo_root)
+    if not demos_by_task_main:
         raise RuntimeError("No demo manifests found in demo_root.")
-    logger.info("[DATA] demo_root=%s tasks_with_demos=%d", args.demo_root, len(demos_by_task))
+    logger.info("[DATA] main demos: root=%s tasks=%d", args.demo_root, len(demos_by_task_main))
+
+    demos_by_task_syn = {}
+    if getattr(args, "syn_demo_root", None):
+        try:
+            demos_by_task_syn = load_all_manifests(args.syn_demo_root)
+            logger.info("[DATA] syn demos: root=%s tasks=%d", args.syn_demo_root, len(demos_by_task_syn))
+        except Exception as e:
+            logger.warning("[DATA] syn_demo_root=%s could not be loaded (%s); continuing without synthetic demos.",
+                        str(args.syn_demo_root), repr(e))
+
 
     # Build task entries
+    # Build task entries (merge main + synthetic by task_id)
     tasks = []
-    for tid, recs in demos_by_task.items():
-        if len(recs) < 1:
+    all_tids = set(demos_by_task_main.keys()) | set(demos_by_task_syn.keys())
+
+    for tid in all_tids:
+        recs_main = demos_by_task_main.get(tid, [])
+        recs_syn  = demos_by_task_syn.get(tid, [])
+
+        if not recs_main and not recs_syn:
             continue
+
+        # locate task dict by numeric index or hash
         if tid in task_index_to_dict:
             tdict = task_index_to_dict[tid]
         elif tid in task_hash_to_dict:
             tdict = task_hash_to_dict[tid]
         else:
+            # No matching task json
             continue
-        assert_start_goal_match(recs, tdict, tid)
-        p2_paths = first_demo_paths(recs, args.demo_root)
-        if len(p2_paths) == 0:
-            continue
-        tasks.append({"task_id": tid, "task_dict": tdict, "p2_paths": p2_paths})
+
+        # sanity: start/goal must match whichever manifests exist
+        if recs_main:
+            assert_start_goal_match(recs_main, tdict, tid)
+        if recs_syn:
+            assert_start_goal_match(recs_syn,  tdict, tid)
+
+        tasks.append({
+            "task_id": tid,
+            "task_dict": tdict,
+            "recs_main": recs_main,
+            "recs_syn":  recs_syn,
+        })
 
     if not tasks:
-        raise RuntimeError("No tasks with phase-2 demos found.")
+        raise RuntimeError("No tasks with demos found across main/synthetic roots.")
+
     random.shuffle(tasks)
     n_val = min(len(tasks), args.val_size)
     val_tasks = tasks[:n_val]
     train_tasks = tasks[n_val:]
     logger.info("[SPLIT] train=%d val=%d (val_size=%d)", len(train_tasks), len(val_tasks), n_val)
+
 
     # Model (plastic head only)
     policy_net = build_model(
@@ -606,12 +666,29 @@ def run_training():
                         Tx = exp_six_dev.shape[0]
                         logger.info("[ESS][REFRESH] tid=%s new_Tx=%d", tid, Tx)
 
-                # Build batched BC tensors from ALL demos (once)
+                # Build batched BC tensors from selected demos for *this epoch*
                 prev_action_start = float(actions_x[-1].item()) if Tx > 0 else 0.0
                 demo_obs_list: List[torch.Tensor] = []
                 demo_lab_list: List[torch.Tensor] = []
 
-                for demo_path in task["p2_paths"]:
+                # choose up to 3 main + 20 synthetic (starting at epoch gate)
+                selected_paths = _select_demo_paths_for_task(
+                    task.get("recs_main", []),
+                    task.get("recs_syn", []),
+                    args,
+                    epoch=epoch,  # 1-indexed epoch available here
+                )
+
+                # (Optional) visibility
+                if is_task_verbose:
+                    logger.info("[SYN] epoch=%d tid=%s using demos: main<=%d syn<=%d selected=%d (syn enabled from epoch %d)",
+                                epoch, task["task_id"],
+                                int(getattr(args, "max_main_demos_per_task", 0)),
+                                int(getattr(args, "max_syn_demos_per_task", 0)),
+                                len(selected_paths),
+                                int(getattr(args, "syn_demo_min_epoch", 3)))
+
+                for demo_path in selected_paths:
                     p2_six, p2_labels = load_phase2_six_and_labels(demo_path, prev_action_start=prev_action_start)
                     if p2_six.numel() == 0:
                         continue
@@ -621,6 +698,7 @@ def run_training():
                     obs6_cat, labels_cat = concat_explore_and_exploit(exp_six_dev, p2_six, p2_labels)
                     demo_obs_list.append(obs6_cat)
                     demo_lab_list.append(labels_cat)
+
 
                 if len(demo_obs_list) == 0:
                     logger.warning("[BC][SKIP] tid=%s no demos to supervise in this batch", tid)
