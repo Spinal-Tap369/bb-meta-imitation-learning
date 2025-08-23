@@ -203,3 +203,39 @@ def collect_explore_vec(
             vec_env.close()
         except Exception:
             pass
+
+def recollect_batch_for_sign(
+    policy_net: torch.nn.Module,
+    per_task_tensors: Dict[int, Dict[str, torch.Tensor]],
+    tasks_used: List[int],
+    device: torch.device,
+    seed_base: int,
+    vec_cap: int,
+    dbg: bool = False,
+    dbg_timing: bool = False,
+    dbg_level: str = "WARNING",
+    log_info: bool = False,
+    sign_label: str = "",
+) -> Dict[int, ExploreRollout]:
+    ros_by_tid: Dict[int, ExploreRollout] = {}
+    if not tasks_used:
+        return ros_by_tid
+    all_cfgs = [MazeTaskManager.TaskConfig(**per_task_tensors[tid]["task_dict"]) for tid in tasks_used]
+    step = max(1, int(vec_cap))
+    for off in range(0, len(all_cfgs), step):
+        cfgs = all_cfgs[off: off + step]
+        slice_tids = tasks_used[off: off + step]
+        if log_info:
+            import logging
+            logging.getLogger(__name__).info(
+                "[COLLECT][ES%s] chunk=%d..%d/%d vec_cap=%d seed_base=%d tasks=%s",
+                sign_label, off, off + len(cfgs) - 1, len(all_cfgs) - 1, step, seed_base + off, slice_tids
+            )
+        ro_list = collect_explore_vec(
+            policy_net, cfgs, device, max_steps=250,
+            seed_base=seed_base + off,
+            dbg=dbg, dbg_timing=dbg_timing, dbg_level=dbg_level
+        )
+        for tid, ro in zip(slice_tids, ro_list):
+            ros_by_tid[tid] = ro
+    return ros_by_tid

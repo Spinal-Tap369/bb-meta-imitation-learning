@@ -5,6 +5,7 @@ import json
 import csv
 import random
 from typing import Dict, List, Tuple
+import logging
 
 import numpy as np
 import torch
@@ -345,3 +346,68 @@ def eval_sampled_val(policy_net, val_task_entries, env, device, sample_n=3, max_
         float(np.mean(totals)),
         float(np.mean(succs)),
     )
+
+import logging, os, sys
+import torch
+
+def _setup_logging(log_file: str | None, level: str):
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    fmt_console = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt_console)
+    root.addHandler(console)
+    if log_file:
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        fmt_file = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        fileh = logging.FileHandler(log_file, mode="a")
+        fileh.setFormatter(fmt_file)
+        root.addHandler(fileh)
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    root.setLevel(lvl)
+
+def _cuda_mem(prefix: str, device):
+    if device.type != "cuda":
+        return "CPU"
+    a = torch.cuda.memory_allocated() / (1024**2)
+    r = torch.cuda.memory_reserved() / (1024**2)
+    return f"{prefix} mem: alloc={a:.1f}MB reserved={r:.1f}MB"
+
+def _shape_str(t):
+    if isinstance(t, torch.Tensor):
+        return f"{tuple(t.shape)} {str(t.dtype).replace('torch.','')}"
+    return str(type(t))
+
+def _count_params(mod: torch.nn.Module):
+    tot = sum(p.numel() for p in mod.parameters())
+    train = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+    return tot, train
+
+def _stats_from_list(vals):
+    if not vals:
+        return dict(n=0, mean=float("nan"), std=float("nan"), min=float("nan"), max=float("nan"))
+    t = torch.tensor(vals, dtype=torch.float32)
+    return dict(n=len(vals), mean=float(t.mean()), std=float(t.std(unbiased=False)),
+                min=float(t.min()), max=float(t.max()))
+
+def _fmt_stats(name, s):
+    prefix = f"{name}:" if name else ""
+    return (f"{prefix}n={s['n']} mean={s['mean']:.4f} std={s['std']:.4f} "
+            f"min={s['min']:.4f} max={s['max']:.4f}")
+
+def _frac_clipped(x: torch.Tensor, clip: float):
+    if not clip or clip <= 0:
+        return 0.0
+    return float((x > clip).float().mean().item())
+
+def _frac_at_clip_abs(x: torch.Tensor, clip: float, eps: float = 1e-6):
+    if not clip or clip <= 0:
+        return 0.0
+    return float((x.abs() >= (clip - eps)).float().mean().item())
+
+def _fmt_ids(ids, limit: int = 8) -> str:
+    ids = list(ids)
+    if len(ids) <= limit:
+        return "[" + ",".join(str(x) for x in ids) + "]"
+    return "[" + ",".join(str(x) for x in ids[:limit]) + ",...;n=" + str(len(ids)) + "]"

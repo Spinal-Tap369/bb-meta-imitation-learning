@@ -1,4 +1,8 @@
+# plastic_train/config.py
+
 import argparse
+import os
+
 
 def parse_args():
     p = argparse.ArgumentParser("BC Meta-Imitation Training (SNAIL) — plastic-only (+ optional ES/SPSA)")
@@ -112,6 +116,8 @@ def parse_args():
                    help="Rank-normalize task fitness before averaging within a perturbation.")
     p.add_argument("--es_fitness_baseline", action="store_true",
                    help="Subtract unperturbed f(θ) from f± before gradient estimate.")
+    p.add_argument("--es_reuse_eps_bank", action="store_true",
+                   help="Pre-sample ES noise (on CPU) once per batch and reuse across nbc steps.")
 
     # Debug (optional)
     p.add_argument("--debug", action="store_true")
@@ -124,17 +130,34 @@ def parse_args():
     p.add_argument("--debug_shapes", action="store_true")
 
     # ----- ES inner PG (ephemeral fast-weights) -----
-    p.add_argument("--es_inner_pg_alpha", type=float, default=0.0, help="If > 0: use a one-step REINFORCE inner update (lr=alpha) inside ES fitness.")
-    p.add_argument("--es_inner_pg_scope", type=str, default="head", choices=["head", "policy"], help="Which params to update in the inner PG step.")
-    p.add_argument("--es_inner_pg_use_is", action="store_true", help="Apply IS weights rho_t in the inner PG loss when reusing behavior data.")
+    p.add_argument("--es_inner_pg_alpha", type=float, default=0.0,
+                   help="If > 0: one-step REINFORCE inner update (lr=alpha) inside ES fitness.")
+    p.add_argument("--es_inner_pg_scope", type=str, default="head", choices=["head", "policy"],
+                   help="Which params to update in the inner PG step.")
+    p.add_argument("--es_inner_pg_use_is", action="store_true",
+                   help="Apply IS weights rho_t in the inner PG loss when reusing behavior data.")
 
-    # inside parse_args()
+    # Data & CPU pipeline knobs
+    default_threads = min(16, os.cpu_count() or 8)
+    p.add_argument("--cpu_threads", type=int, default=default_threads,
+                   help="torch.set_num_threads(); also exported to OMP_NUM_THREADS")
+    p.add_argument("--cpu_workers", type=int, default=max(4, default_threads // 2),
+                   help="Thread-pool workers for CPU demo decode/augmentation/build")
+    p.add_argument("--pin_memory", action="store_true",
+                   help="Pin host memory for H2D and use a dedicated CUDA copy stream")
+    p.add_argument("--prefetch_batches", type=int, default=1,
+                   help="One-batch look-ahead NPZ prefetch (CPU-only). Set 0 to disable.")
+    p.add_argument("--cudnn_benchmark", action="store_true",
+                   help="Enable cudnn.benchmark for convs (slightly nondeterministic).")
+
+    # Synthetic demos
     p.add_argument("--syn_demo_root", type=str, default=None,
-                help="Optional second demo root for synthetic demos (same layout as main).")
+                   help="Optional second demo root for synthetic demos (same layout as main).")
     p.add_argument("--syn_demo_min_epoch", type=int, default=3,
-                help="Begin including synthetic demos at this (1-indexed) epoch.")
+                   help="Begin including synthetic demos at this (1-indexed) epoch.")
     p.add_argument("--max_main_demos_per_task", type=int, default=3,
-                help="Max number of main demos per task to use.")
+                   help="Max number of main demos per task to use.")
     p.add_argument("--max_syn_demos_per_task", type=int, default=20,
-                help="Max number of synthetic demos per task to use once enabled.")
+                   help="Max number of synthetic demos per task to use once enabled.")
+
     return p.parse_args()
