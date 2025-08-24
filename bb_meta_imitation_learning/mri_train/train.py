@@ -1,6 +1,6 @@
 # mri_train/train.py
 
-import os, sys, json, math, random, logging
+import os, sys, json, math, random, logging, gc
 from typing import Dict, List, Optional, Tuple, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -151,12 +151,9 @@ def _rebuild_task_entry_from_ro(entry: Dict[str, torch.Tensor],
 
     batch_obs_cpu, batch_lab_cpu = _pad_and_stack_cpu(demo_obs_list, demo_lab_list)
     if getattr(args, "pin_memory", False):
+        # Only pin the short-lived batch tensors
         batch_obs_cpu = batch_obs_cpu.pin_memory()
         batch_lab_cpu = batch_lab_cpu.pin_memory()
-        exp_six_cpu = exp_six_cpu.pin_memory()
-        actions_cpu = actions_cpu.pin_memory()
-        rewards_cpu = rewards_cpu.pin_memory()
-        beh_logits_cpu = beh_logits_cpu.pin_memory()
 
     entry.update({
         "batch_obs_cpu": batch_obs_cpu,
@@ -181,6 +178,9 @@ def _rebuild_task_entry_from_ro(entry: Dict[str, torch.Tensor],
 # ---------- main ----------
 
 def run_training():
+    # Better fragmentation behavior (ideally set before process start)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     from .remap import remap_pretrained_state
     args = parse_args()
 
@@ -434,10 +434,11 @@ def run_training():
                 beh_logits_cpu = ro.beh_logits
                 Tx = exp_six_cpu.shape[0]
 
-                # stats vs current policy
+                # stats vs current policy (AMP + no_grad)
                 with torch.no_grad():
-                    logits_now_tmp, _ = policy_net(exp_six_cpu.unsqueeze(0).to(device, non_blocking=True))
-                    logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
+                    with autocast(device_type="cuda", enabled=use_amp):
+                        logits_now_tmp, _ = policy_net(exp_six_cpu.unsqueeze(0).to(device, non_blocking=True))
+                        logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
                     lp_cur = torch.log_softmax(logits_now_tmp, dim=-1).gather(1, actions_cpu.to(device, non_blocking=True).unsqueeze(1)).squeeze(1)
                     lp_beh = torch.log_softmax(beh_logits_cpu.to(device, non_blocking=True), dim=-1).gather(1, actions_cpu.to(device, non_blocking=True).unsqueeze(1)).squeeze(1)
                     rhos = torch.exp(lp_cur - lp_beh)
@@ -445,6 +446,7 @@ def run_training():
                         rhos = torch.clamp(rhos, max=args.is_clip_rho)
                     ess_ratio_val = ess_ratio_from_rhos(rhos).item()
                     kl_val = mean_kl_logits(logits_now_tmp, beh_logits_cpu.to(device, non_blocking=True)).item()
+                    del logits_now_tmp
 
                 batch_kl_vals.append(kl_val)
                 batch_ess_vals.append(ess_ratio_val)
@@ -460,14 +462,16 @@ def run_training():
                     exp_six_cpu = ro.obs6; actions_cpu = ro.actions; rewards_cpu = ro.rewards; beh_logits_cpu = ro.beh_logits
                     Tx = exp_six_cpu.shape[0]
                     with torch.no_grad():
-                        logits_now_tmp, _ = policy_net(exp_six_cpu.unsqueeze(0).to(device, non_blocking=True))
-                        logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
+                        with autocast(device_type="cuda", enabled=use_amp):
+                            logits_now_tmp, _ = policy_net(exp_six_cpu.unsqueeze(0).to(device, non_blocking=True))
+                            logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
                         lp_cur = torch.log_softmax(logits_now_tmp, dim=-1).gather(1, actions_cpu.to(device, non_blocking=True).unsqueeze(1)).squeeze(1)
                         lp_beh = torch.log_softmax(beh_logits_cpu.to(device, non_blocking=True), dim=-1).gather(1, actions_cpu.to(device, non_blocking=True).unsqueeze(1)).squeeze(1)
                         rhos = torch.exp(lp_cur - lp_beh)
                         if getattr(args, "is_clip_rho", 0.0) > 0:
                             rhos = torch.clamp(rhos, max=args.is_clip_rho)
                         ess_ratio_val = ess_ratio_from_rhos(rhos).item()
+                        del logits_now_tmp
 
                 if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
                     if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio_val < args.ess_refresh_ratio:
@@ -500,12 +504,9 @@ def run_training():
 
                 batch_obs_cpu, batch_lab_cpu = _pad_and_stack_cpu(demo_obs_list, demo_lab_list)
                 if getattr(args, "pin_memory", False):
+                    # Only pin short-lived batch tensors
                     batch_obs_cpu = batch_obs_cpu.pin_memory()
                     batch_lab_cpu = batch_lab_cpu.pin_memory()
-                    exp_six_cpu = exp_six_cpu.pin_memory()
-                    actions_cpu = actions_cpu.pin_memory()
-                    rewards_cpu = rewards_cpu.pin_memory()
-                    beh_logits_cpu = beh_logits_cpu.pin_memory()
 
                 per_task_tensors[tid] = {
                     "batch_obs_cpu": batch_obs_cpu,
@@ -552,22 +553,23 @@ def run_training():
             )
 
             # =========================
-            # MRI OUTER LOOP
+            # MRI OUTER LOOP (streamed backward)
             # =========================
             for step_idx in range(args.nbc):
                 optimizer.zero_grad(set_to_none=True)
 
-                # named params for inner updates (exclude critic head)
-                from collections import OrderedDict
+                # names for inner updates (exclude critic head)
                 named_all = _named_trainable(policy_net)
                 adapt_names = [n for n in named_all.keys() if n not in _critic_param_names(policy_net)]
-                named_adapt = OrderedDict((n, named_all[n]) for n in adapt_names)
 
-                bc_losses = []
-                pg_losses = []
-                correction_terms = []
-                sum_logps_buffer = []
-                bc_scalars_for_baseline = []
+                tasks_n = len(tasks_used)
+                total_bc_val = 0.0
+                total_corr_val = 0.0
+                pg_vals = []
+
+                # running baseline if 'batch' is requested
+                batch_mean_bc = 0.0
+                batch_seen = 0
 
                 for tid in tasks_used:
                     t = per_task_tensors[tid]
@@ -584,9 +586,9 @@ def run_training():
                     alpha = float(getattr(args, "inner_pg_alpha", 0.1))
 
                     for k in range(int(getattr(args, "inner_steps", 1))):
-                        # forward on explore trajectory under (current) θ_k
-                        logits_seq, _ = _functional_call(policy_net, params_k, (exp.unsqueeze(0),))
-                        logits_seq = logits_seq[0]
+                        with autocast(device_type="cuda", enabled=use_amp):
+                            logits_seq, _ = _functional_call(policy_net, params_k, (exp.unsqueeze(0),))
+                            logits_seq = logits_seq[0]
 
                         # compute advantages with linear baseline
                         returns = discounted_returns(rews, args.gamma)
@@ -604,13 +606,14 @@ def run_training():
 
                         if bool(getattr(args, "inner_use_is", False)):
                             lp_beh = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
-                            rho = torch.exp(logp_cur.detach() - lp_beh)  # detach to avoid 2nd-order through rho
+                            rho = torch.exp(logp_cur.detach() - lp_beh)
                             if getattr(args, "is_clip_rho", 0.0) > 0:
                                 rho = torch.clamp(rho, max=args.is_clip_rho)
                             inner_loss = - ((rho * logp_cur) * adv_norm).mean()
                         else:
                             inner_loss = - (logp_cur * adv_norm).mean()
-                        pg_losses.append(inner_loss.detach().item())
+
+                        pg_vals.append(inner_loss.detach().item())
 
                         grads = torch.autograd.grad(
                             inner_loss,
@@ -623,22 +626,27 @@ def run_training():
                         for (n, _p), g in zip(((n, params_k[n]) for n in adapt_names), grads):
                             params_k[n] = params_k[n] - alpha * g
 
+                        del logits_seq, returns, adv, adv_norm, logp_cur
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+
                     # ----- Outer BC at φ (params_k) -----
                     loss_bc_phi = _functional_bc_loss_at_phi(
                         policy_net, params_k, t["batch_obs_dev"], t["batch_lab_dev"],
                         smoothing=float(getattr(args, "label_smoothing", 0.0)), use_amp=use_amp
                     )
-                    bc_losses.append(loss_bc_phi)
                     bc_scalar_detached = float(loss_bc_phi.detach().item())
-                    bc_scalars_for_baseline.append(bc_scalar_detached)
+                    total_bc_val += bc_scalar_detached
 
                     # ----- Meta-descent correction term (score-function) -----
+                    corr_loss = 0.0
                     if bool(getattr(args, "meta_corr", False)):
-                        logits_theta, _ = policy_net(exp.unsqueeze(0))   # θ at current (pre-update) params
-                        logits_theta = logits_theta[0]
+                        with autocast(device_type="cuda", enabled=use_amp):
+                            logits_theta, _ = policy_net(exp.unsqueeze(0))   # θ at current (pre-update) params
+                            logits_theta = logits_theta[0]
                         logp_theta = torch.log_softmax(logits_theta, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
 
-                        # Importance weights (detach in the multiplier)
+                        # IS weights; multiplier detached where appropriate
                         if bool(getattr(args, "meta_corr_use_is", False)):
                             lp_beh = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
                             w_imp = torch.exp(logp_theta.detach() - lp_beh)
@@ -647,44 +655,44 @@ def run_training():
                         else:
                             w_imp = torch.ones_like(logp_theta)
 
-                        # Weighted centering (variance reduction); normalize by T via mean
                         if bool(getattr(args, "meta_corr_center_logp", False)):
-                            wmean = (w_imp * logp_theta).sum() / (w_imp.sum() + 1e-8)
+                            # detach the weighted mean so gradients don't flow through centering value
+                            wmean = ((w_imp * logp_theta).sum() / (w_imp.sum() + 1e-8)).detach()
                             logp_theta = logp_theta - wmean
 
                         sum_logp = (w_imp.detach() * logp_theta).mean()
-                        correction_loss = - float(getattr(args, "meta_corr_coeff", 1.0)) * (loss_bc_phi.detach()) * sum_logp
-                        correction_terms.append(correction_loss)
-                        sum_logps_buffer.append(float(sum_logp.detach().item()))
+                        coeff = float(getattr(args, "meta_corr_coeff", 1.0))
 
-                if len(bc_losses) == 0:
-                    continue
+                        # baseline selection in streaming mode
+                        if str(getattr(args, "meta_corr_baseline", "batch")) == "ema":
+                            bval = float(ema_baseline) if (ema_baseline is not None) else 0.0
+                        else:  # "batch": running mean of seen tasks
+                            bval = float(batch_mean_bc) if batch_seen > 0 else 0.0
 
-                # Compute baseline for correction and re-center if requested
-                corr_loss_total = 0.0
-                if bool(getattr(args, "meta_corr", False)) and len(correction_terms) > 0:
-                    if str(getattr(args, "meta_corr_baseline", "batch")) == "batch":
-                        bval = float(np.mean(bc_scalars_for_baseline))
-                    elif str(getattr(args, "meta_corr_baseline", "batch")) == "ema":
+                        corr_loss = - coeff * (loss_bc_phi.detach() - bval) * sum_logp
+                        total_corr_val += float(corr_loss.detach().item())
+
+                        del logits_theta, logp_theta, w_imp, sum_logp
+
+                    # ---- Stream backward now: free each task graph immediately ----
+                    task_loss = loss_bc_phi + (corr_loss if bool(getattr(args, "meta_corr", False)) else 0.0)
+                    scaler.scale(task_loss / tasks_n).backward()
+
+                    # update baselines after using bval
+                    if str(getattr(args, "meta_corr_baseline", "batch")) == "ema":
                         if ema_baseline is None:
-                            ema_baseline = float(np.mean(bc_scalars_for_baseline))
-                        ema_beta = float(getattr(args, "meta_corr_ema_beta", 0.9))
-                        ema_baseline = ema_beta * ema_baseline + (1.0 - ema_beta) * float(np.mean(bc_scalars_for_baseline))
-                        bval = float(ema_baseline)
+                            ema_baseline = bc_scalar_detached
+                        else:
+                            ema_beta = float(getattr(args, "meta_corr_ema_beta", 0.9))
+                            ema_baseline = ema_beta * ema_baseline + (1.0 - ema_beta) * bc_scalar_detached
                     else:
-                        bval = 0.0
+                        batch_seen += 1
+                        batch_mean_bc = ((batch_seen - 1) * batch_mean_bc + bc_scalar_detached) / max(1, batch_seen)
 
-                    # re-build correction terms with (L_outer - b)
-                    corr_terms_centered = []
-                    for loss_bc_phi, tterm in zip(bc_losses, correction_terms):
-                        scale = (loss_bc_phi.detach() - bval) / (loss_bc_phi.detach() + 1e-8)  # safe rescale
-                        corr_terms_centered.append(tterm * scale)
-                    corr_loss_total = sum(corr_terms_centered) / float(len(corr_terms_centered))
+                    # Help GC
+                    del params_k, loss_bc_phi
 
-                total_bc = sum(bc_losses) / float(len(bc_losses))
-                total_loss = total_bc + (corr_loss_total if bool(getattr(args, "meta_corr", False)) else 0.0)
-
-                scaler.scale(total_loss).backward()
+                # one optimizer step for the whole step_idx
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
                 if torch.isfinite(grad_norm):
@@ -695,21 +703,22 @@ def run_training():
 
                 # bookkeeping
                 for tid in tasks_used:
-                    explore_cache[tid].reuse_count += 1
+                    try:
+                        explore_cache[tid].reuse_count += 1
+                    except Exception:
+                        pass
 
-                running_bc += float(total_bc.detach().item())
-                running_pg += (np.mean(pg_losses) if pg_losses else 0.0)
-                running_corr += (float(corr_loss_total.detach().item()) if bool(getattr(args, "meta_corr", False)) else 0.0)
+                running_bc += total_bc_val / max(1, tasks_n)
+                running_pg += (np.mean(pg_vals) if pg_vals else 0.0)
+                running_corr += (total_corr_val / max(1, tasks_n) if bool(getattr(args, "meta_corr", False)) else 0.0)
                 count_updates += 1
 
                 logger.info(
-                    "[MRI][STEP %d/%d] outer_BC=%.4f | inner_pg(mean)=%.4f | corr_loss=%.4f | "
-                    "sum_logp(mean)=%.4f | grad_norm=%.3e",
+                    "[MRI][STEP %d/%d] outer_BC=%.4f | inner_pg(mean)=%.4f | corr_loss=%.4f | grad_norm=%.3e",
                     step_idx + 1, args.nbc,
-                    float(total_bc.detach().item()),
-                    float(np.mean(pg_losses) if pg_losses else 0.0),
-                    float(corr_loss_total.detach().item() if bool(getattr(args, "meta_corr", False)) else 0.0),
-                    float(np.mean(sum_logps_buffer) if sum_logps_buffer else 0.0),
+                    float(total_bc_val / max(1, tasks_n)),
+                    float(np.mean(pg_vals) if pg_vals else 0.0),
+                    float(total_corr_val / max(1, tasks_n) if bool(getattr(args, "meta_corr", False)) else 0.0),
                     float(grad_norm if torch.is_tensor(grad_norm) else grad_norm),
                 )
 
@@ -733,10 +742,17 @@ def run_training():
                                 per_task_tensors[tid], ro_new, device, args, npz_cache
                             )
 
+                # Step-level cleanup
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
+                gc.collect()
 
+            # ----- End of batch cleanup -----
             per_task_tensors.clear()
+            del per_task_tensors, tasks_used
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
 
             if count_updates > 0 and not getattr(args, "no_tqdm", False):
                 pbar.set_postfix(
