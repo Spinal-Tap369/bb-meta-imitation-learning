@@ -39,8 +39,6 @@ from .utils import (
     _count_params,
     _stats_from_list,
     _fmt_stats,
-    _fmt_ids,
-    _rebuild_task_entry_from_ro,
 )
 from .data import (
     concat_explore_and_exploit,
@@ -717,6 +715,23 @@ def run_training():
                     float(np.mean(sum_logps_buffer) if sum_logps_buffer else 0.0),
                     float(grad_norm if torch.is_tensor(grad_norm) else grad_norm),
                 )
+
+                # --- Mid-batch vectorized recollect to enforce the reuse budget ---
+                reuse_budget = max(1, int(getattr(args, "explore_reuse_M", 1)))
+                if (step_idx + 1) % reuse_budget == 0:
+                    cfgs = [MazeTaskManager.TaskConfig(**per_task_tensors[tid]["task_dict"]) for tid in tasks_used]
+                    seed_here = args.seed + 100000 * epoch + 1000 * b + (step_idx + 1)
+                    ro_list = collect_explore_vec(policy_net, cfgs, device, max_steps=250, seed_base=seed_here, dbg=False)
+                    for tid, ro_new in zip(tasks_used, ro_list):
+                        explore_cache[tid] = ro_new
+                        try:
+                            ro_new.reuse_count = 0
+                        except Exception:
+                            pass
+                        # Rebuild this task's tensors against the fresh explore rollout
+                        entry = per_task_tensors[tid]
+                        per_task_tensors[tid] = _rebuild_task_entry_from_ro(entry, ro_new, device, args, npz_cache)
+
 
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
