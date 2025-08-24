@@ -39,6 +39,7 @@ from .utils import (
     _count_params,
     _stats_from_list,
     _fmt_stats,
+    _fmt_ids,
 )
 from .data import (
     concat_explore_and_exploit,
@@ -51,6 +52,13 @@ from .explore import ExploreRollout, collect_explore_vec, make_base_env
 from .rl_loss import mean_kl_logits, ess_ratio_from_rhos, discounted_returns
 
 logger = logging.getLogger(__name__)
+
+# ---- functional_call compatibility (PyTorch 2.0+ uses torch.func) ----
+try:
+    from torch.func import functional_call as _functional_call
+except Exception:
+    from torch.nn.utils.stateless import functional_call as _functional_call
+
 
 # ---------- helpers ----------
 
@@ -84,9 +92,8 @@ def _functional_bc_loss_at_phi(model: nn.Module,
     Stateless forward at adapted parameters φ to compute BC loss.
     """
     try:
-        from torch.nn.utils.stateless import functional_call
         with autocast(device_type="cuda", enabled=use_amp):
-            logits_phi, _ = functional_call(model, params_phi, (batch_obs,))
+            logits_phi, _ = _functional_call(model, params_phi, (batch_obs,))
             if smoothing > 0.0:
                 loss_bc_phi = smoothed_cross_entropy(logits_phi, batch_lab, ignore_index=PAD_ACTION, smoothing=smoothing)
             else:
@@ -573,17 +580,12 @@ def run_training():
                         exp = exp[-args.adapt_trunc_T:]; acts = acts[-args.adapt_trunc_T:]; rews = rews[-args.adapt_trunc_T:]; beh  = beh[-args.adapt_trunc_T:]
 
                     # ----- Inner policy gradient steps (on θ) -----
-                    # we re-compute logits per inner step; create_graph=True if second-order
-                    params_theta = list(named_adapt.values())
-                    cur_params = named_all  # reference
+                    params_k = OrderedDict((n, p) for n, p in named_all.items())
                     alpha = float(getattr(args, "inner_pg_alpha", 0.1))
 
-                    # We'll repeatedly produce params_phi_k to use in the final outer BC call
-                    params_k = OrderedDict((n, p) for n, p in named_all.items())
                     for k in range(int(getattr(args, "inner_steps", 1))):
                         # forward on explore trajectory under (current) θ_k
-                        from torch.nn.utils.stateless import functional_call
-                        logits_seq, _ = functional_call(policy_net, params_k, (exp.unsqueeze(0),))
+                        logits_seq, _ = _functional_call(policy_net, params_k, (exp.unsqueeze(0),))
                         logits_seq = logits_seq[0]
 
                         # compute advantages with linear baseline
@@ -639,24 +641,21 @@ def run_training():
                         # Importance weights (detach in the multiplier)
                         if bool(getattr(args, "meta_corr_use_is", False)):
                             lp_beh = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
-                            w = torch.exp(logp_theta.detach() - lp_beh)
+                            w_imp = torch.exp(logp_theta.detach() - lp_beh)
                             if getattr(args, "is_clip_rho", 0.0) > 0:
-                                w = torch.clamp(w, max=args.is_clip_rho)
+                                w_imp = torch.clamp(w_imp, max=args.is_clip_rho)
                         else:
-                            w = torch.ones_like(logp_theta)
+                            w_imp = torch.ones_like(logp_theta)
 
-                        # Weighted centering (variance reduction); then normalize by T
+                        # Weighted centering (variance reduction); normalize by T via mean
                         if bool(getattr(args, "meta_corr_center_logp", False)):
-                            wmean = (w * logp_theta).sum() / (w.sum() + 1e-8)
+                            wmean = (w_imp * logp_theta).sum() / (w_imp.sum() + 1e-8)
                             logp_theta = logp_theta - wmean
 
-                        # Use mean (not sum) so the magnitude is scale-free in T
-                        sum_logp = (w.detach() * logp_theta).mean()
-
+                        sum_logp = (w_imp.detach() * logp_theta).mean()
                         correction_loss = - float(getattr(args, "meta_corr_coeff", 1.0)) * (loss_bc_phi.detach()) * sum_logp
                         correction_terms.append(correction_loss)
                         sum_logps_buffer.append(float(sum_logp.detach().item()))
-
 
                 if len(bc_losses) == 0:
                     continue
@@ -677,11 +676,9 @@ def run_training():
 
                     # re-build correction terms with (L_outer - b)
                     corr_terms_centered = []
-                    for loss_bc_phi, t in zip(bc_losses, correction_terms):
-                        # t was computed as -coeff * (L_outer_detach) * sum_logp
-                        # Replace the scalar with (L_outer_detach - b)
+                    for loss_bc_phi, tterm in zip(bc_losses, correction_terms):
                         scale = (loss_bc_phi.detach() - bval) / (loss_bc_phi.detach() + 1e-8)  # safe rescale
-                        corr_terms_centered.append(t * scale)
+                        corr_terms_centered.append(tterm * scale)
                     corr_loss_total = sum(corr_terms_centered) / float(len(corr_terms_centered))
 
                 total_bc = sum(bc_losses) / float(len(bc_losses))
@@ -719,19 +716,22 @@ def run_training():
                 # --- Mid-batch vectorized recollect to enforce the reuse budget ---
                 reuse_budget = max(1, int(getattr(args, "explore_reuse_M", 1)))
                 if (step_idx + 1) % reuse_budget == 0:
-                    cfgs = [MazeTaskManager.TaskConfig(**per_task_tensors[tid]["task_dict"]) for tid in tasks_used]
-                    seed_here = args.seed + 100000 * epoch + 1000 * b + (step_idx + 1)
-                    ro_list = collect_explore_vec(policy_net, cfgs, device, max_steps=250, seed_base=seed_here, dbg=False)
-                    for tid, ro_new in zip(tasks_used, ro_list):
-                        explore_cache[tid] = ro_new
-                        try:
-                            ro_new.reuse_count = 0
-                        except Exception:
-                            pass
-                        # Rebuild this task's tensors against the fresh explore rollout
-                        entry = per_task_tensors[tid]
-                        per_task_tensors[tid] = _rebuild_task_entry_from_ro(entry, ro_new, device, args, npz_cache)
-
+                    vec_cap = int(getattr(args, "num_envs", 8))
+                    for off in range(0, len(tasks_used), max(1, vec_cap)):
+                        tids_slice = tasks_used[off : off + max(1, vec_cap)]
+                        cfgs = [MazeTaskManager.TaskConfig(**per_task_tensors[tid]["task_dict"]) for tid in tids_slice]
+                        seed_here = args.seed + 100000 * epoch + 1000 * b + (step_idx + 1) + off
+                        ro_list = collect_explore_vec(policy_net, cfgs, device, max_steps=250, seed_base=seed_here, dbg=False)
+                        for tid, ro_new in zip(tids_slice, ro_list):
+                            explore_cache[tid] = ro_new
+                            try:
+                                ro_new.reuse_count = 0
+                            except Exception:
+                                pass
+                            # Rebuild this task's tensors against the fresh explore rollout
+                            per_task_tensors[tid] = _rebuild_task_entry_from_ro(
+                                per_task_tensors[tid], ro_new, device, args, npz_cache
+                            )
 
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
