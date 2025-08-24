@@ -40,6 +40,7 @@ from .utils import (
     _stats_from_list,
     _fmt_stats,
     _fmt_ids,
+    _rebuild_task_entry_from_ro,
 )
 from .data import (
     concat_explore_and_exploit,
@@ -112,6 +113,65 @@ def _functional_bc_loss_at_phi(model: nn.Module,
             return loss_bc_phi
         finally:
             model.load_state_dict(sd_backup, strict=False)
+
+def _rebuild_task_entry_from_ro(entry: Dict[str, torch.Tensor],
+                                ro: ExploreRollout,
+                                device: torch.device,
+                                args,
+                                npz_cache: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> Dict[str, torch.Tensor]:
+    """Rebuild explore+exploit tensors for a task entry after a fresh recollect."""
+    exp_six_cpu = ro.obs6
+    actions_cpu = ro.actions
+    rewards_cpu = ro.rewards
+    beh_logits_cpu = ro.beh_logits
+    Tx = exp_six_cpu.shape[0]
+    prev_action_start = float(actions_cpu[-1].item()) if Tx > 0 else 0.0
+
+    demo_obs_list: List[torch.Tensor] = []
+    demo_lab_list: List[torch.Tensor] = []
+    for demo_path in entry["selected_paths"]:
+        pre = npz_cache.pop(demo_path, None)
+        p2_six, p2_labels = load_phase2_six_and_labels(demo_path, prev_action_start=prev_action_start, preloaded=pre)
+        if p2_six.numel() == 0:
+            continue
+        p2_six = maybe_augment_demo_six_cpu(p2_six, args)
+        obs6_cat, labels_cat = concat_explore_and_exploit(exp_six_cpu, p2_six, p2_labels)
+        demo_obs_list.append(obs6_cat)
+        demo_lab_list.append(labels_cat)
+
+    if len(demo_obs_list) == 0:
+        # Nothing to supervise; keep explore cache but don't touch tensors.
+        entry["ro"] = ro
+        return entry
+
+    batch_obs_cpu, batch_lab_cpu = _pad_and_stack_cpu(demo_obs_list, demo_lab_list)
+    if getattr(args, "pin_memory", False):
+        batch_obs_cpu = batch_obs_cpu.pin_memory()
+        batch_lab_cpu = batch_lab_cpu.pin_memory()
+        exp_six_cpu = exp_six_cpu.pin_memory()
+        actions_cpu = actions_cpu.pin_memory()
+        rewards_cpu = rewards_cpu.pin_memory()
+        beh_logits_cpu = beh_logits_cpu.pin_memory()
+
+    entry.update({
+        "batch_obs_cpu": batch_obs_cpu,
+        "batch_lab_cpu": batch_lab_cpu,
+        "exp_cpu": exp_six_cpu,
+        "actions_cpu": actions_cpu,
+        "rewards_cpu": rewards_cpu,
+        "beh_logits_cpu": beh_logits_cpu,
+        "ro": ro,
+    })
+
+    # Refresh device copies immediately (no need to wait for the next copy-stream)
+    entry["batch_obs_dev"]   = batch_obs_cpu.to(device, non_blocking=True)
+    entry["batch_lab_dev"]   = batch_lab_cpu.to(device, non_blocking=True)
+    entry["exp_dev"]         = exp_six_cpu.to(device, non_blocking=True)
+    entry["actions_dev"]     = actions_cpu.to(device, non_blocking=True)
+    entry["rewards_dev"]     = rewards_cpu.to(device, non_blocking=True)
+    entry["beh_logits_dev"]  = beh_logits_cpu.to(device, non_blocking=True)
+    return entry
+
 
 # ---------- main ----------
 
@@ -451,6 +511,7 @@ def run_training():
                     "beh_logits_cpu": beh_logits_cpu,
                     "ro": ro,
                     "task_dict": task["task_dict"],
+                    "selected_paths": selected_paths,
                 }
                 tasks_used.append(tid)
 
@@ -573,30 +634,31 @@ def run_training():
 
                     # ----- Meta-descent correction term (score-function) -----
                     if bool(getattr(args, "meta_corr", False)):
-                        # re-use the last logits_seq from inner (under θ_K==params_k BEFORE update?):
-                        # The correction uses ∑_t ∇θ logπθ(a_t|s_t) evaluated at the SAME θ the rollout was collected from.
-                        # Here we evaluate at current pre-update θ (named_all); IS option can reweight per-step.
-                        logits_theta, _ = policy_net(exp.unsqueeze(0))
+                        logits_theta, _ = policy_net(exp.unsqueeze(0))   # θ at current (pre-update) params
                         logits_theta = logits_theta[0]
                         logp_theta = torch.log_softmax(logits_theta, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
 
-                        if bool(getattr(args, "meta_corr_center_logp", False)):
-                            logp_theta = logp_theta - logp_theta.mean()
-
+                        # Importance weights (detach in the multiplier)
                         if bool(getattr(args, "meta_corr_use_is", False)):
                             lp_beh = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
-                            rho_corr = torch.exp(logp_theta.detach() - lp_beh)
+                            w = torch.exp(logp_theta.detach() - lp_beh)
                             if getattr(args, "is_clip_rho", 0.0) > 0:
-                                rho_corr = torch.clamp(rho_corr, max=args.is_clip_rho)
-                            sum_logp = (rho_corr.detach() * logp_theta).sum()
+                                w = torch.clamp(w, max=args.is_clip_rho)
                         else:
-                            sum_logp = logp_theta.sum()
+                            w = torch.ones_like(logp_theta)
 
-                        # Loss whose gradient adds + (L_outer(φ) - b) * ∑ ∇ logπ
-                        # (we detach L_outer to avoid the cross term)
+                        # Weighted centering (variance reduction); then normalize by T
+                        if bool(getattr(args, "meta_corr_center_logp", False)):
+                            wmean = (w * logp_theta).sum() / (w.sum() + 1e-8)
+                            logp_theta = logp_theta - wmean
+
+                        # Use mean (not sum) so the magnitude is scale-free in T
+                        sum_logp = (w.detach() * logp_theta).mean()
+
                         correction_loss = - float(getattr(args, "meta_corr_coeff", 1.0)) * (loss_bc_phi.detach()) * sum_logp
                         correction_terms.append(correction_loss)
                         sum_logps_buffer.append(float(sum_logp.detach().item()))
+
 
                 if len(bc_losses) == 0:
                     continue
