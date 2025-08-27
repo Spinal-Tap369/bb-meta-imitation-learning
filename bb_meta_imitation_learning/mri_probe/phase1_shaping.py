@@ -1,4 +1,4 @@
-# plastic_train/phase1_shaping.py
+# mri_train/phase1_shaping.py
 
 import numpy as np
 from collections import deque

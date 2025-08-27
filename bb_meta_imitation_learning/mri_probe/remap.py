@@ -1,4 +1,4 @@
-# plastic_train/remap.py
+# mri_train/remap.py
 
 from typing import Dict, List
 import logging
@@ -14,7 +14,6 @@ def remap_pretrained_state(src_sd: Dict[str, torch.Tensor], model: nn.Module) ->
       - add 'core.' prefix when missing
       - action_head -> policy_head
       - value_head  -> critic_head (older name)
-      - policy_head.weight -> policy_head.W (plastic head variant)
     Keep only keys that exist in the destination model AND match shape.
     """
     model_sd = model.state_dict()
@@ -34,11 +33,6 @@ def remap_pretrained_state(src_sd: Dict[str, torch.Tensor], model: nn.Module) ->
             cands.add(b)
             cands.add(b.replace("action_head", "policy_head"))
             cands.add(b.replace("value_head", "critic_head"))
-            # plastic head param rename: weight -> W
-            if ".policy_head.weight" in b:
-                cands.add(b.replace(".policy_head.weight", ".policy_head.W"))
-            if ".policy_head.weight" in b.replace("action_head", "policy_head"):
-                cands.add(b.replace("action_head", "policy_head").replace(".policy_head.weight", ".policy_head.W"))
         return list(cands)
 
     out = {}

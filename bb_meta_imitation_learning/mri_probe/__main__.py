@@ -1,4 +1,4 @@
-# plastic_train/__main__.py
+# mri_train/__main__.py
 
 from .train import run_training
 

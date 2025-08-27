@@ -18,7 +18,7 @@ setup(
         "console_scripts": [
             "bc-pretrainer=bb_meta_imitation_learning.bc_pre_trainer.main:main",
             "mri_train=bb_meta_imitation_learning.mri_train.train:run_training",
-            "mri_train2=bb_meta_imitation_learning.mri_train.train2:run_training",
+            "mri_probe=bb_meta_imitation_learning.mri_probe.train:run_training",
         ],
     },
     python_requires=">=3.7",

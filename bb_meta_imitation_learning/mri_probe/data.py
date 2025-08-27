@@ -1,4 +1,4 @@
-# plastic_train/data.py
+# mri_train/data.py
 
 from typing import Dict, List, Tuple, Optional
 import os
@@ -14,11 +14,10 @@ from .utils import (
     apply_spatial_jitter,
 )
 
-
 def concat_explore_and_exploit(explore_six: torch.Tensor, exploit_six: torch.Tensor, exploit_labels: torch.Tensor):
     """
-    Concatenate (CPU by default) explore and exploit sequences along time.
-    The explore part is padded with PAD_ACTION labels; exploit part gets the 'phase-2' flag in channel 5.
+    Concatenate explore and exploit sequences along time on CPU.
+    Explore part is padded with PAD_ACTION; exploit part gets the 'phase-2' flag in channel 5.
     """
     if explore_six.is_cuda or exploit_six.is_cuda or exploit_labels.is_cuda:
         raise RuntimeError("concat_explore_and_exploit expects CPU tensors; H2D is handled centrally.")
@@ -31,12 +30,10 @@ def concat_explore_and_exploit(explore_six: torch.Tensor, exploit_six: torch.Ten
     labels_cat = torch.cat([torch.full((Tx,), PAD_ACTION, dtype=torch.long), exploit_labels], dim=0)
     return obs6_cat, labels_cat
 
-
 def first_demo_paths(ex_record_list: List[Dict], demo_root: str) -> List[str]:
     demos_p2 = [r for r in ex_record_list if int(r.get("phase", 2)) == 2]
     demos_p2 = sorted(demos_p2, key=lambda r: r["frames"])
     return [os.path.join(demo_root, r["file"]) for r in demos_p2]
-
 
 def _manifest_p2_pairs(recs: List[Dict]) -> List[Tuple[int, int, int, int]]:
     pairs = []
@@ -50,7 +47,6 @@ def _manifest_p2_pairs(recs: List[Dict]) -> List[Tuple[int, int, int, int]]:
         pairs.append((int(sx), int(sy), int(gx), int(gy)))
     return pairs
 
-
 def assert_start_goal_match(recs: List[Dict], tdict: Dict, tid: int):
     pairs = _manifest_p2_pairs(recs)
     if not pairs:
@@ -59,9 +55,9 @@ def assert_start_goal_match(recs: List[Dict], tdict: Dict, tid: int):
     for p in pairs[1:]:
         uniq.add(p)
     if len(uniq) > 1:
-        raise RuntimeError(
-            f"[TASK {tid}] Demo manifest contains multiple (start,goal) pairs for phase-2: {sorted(list(uniq))}"
-        )
+            raise RuntimeError(
+                f"[TASK {tid}] Demo manifest contains multiple (start,goal) pairs for phase-2: {sorted(list(uniq))}"
+            )
     msx, msy, mgx, mgy = pairs[0]
     ts = tuple(tdict.get("start", (None, None)))
     tg = tuple(tdict.get("goal", (None, None)))
@@ -69,7 +65,6 @@ def assert_start_goal_match(recs: List[Dict], tdict: Dict, tid: int):
         raise RuntimeError(
             f"[TASK {tid}] train_trials.json start/goal {ts}->{tg} do not match manifest {(msx, msy)}->{(mgx, mgy)}"
         )
-
 
 def load_phase2_six_and_labels(
     demo_path: str,
@@ -93,7 +88,6 @@ def load_phase2_six_and_labels(
     boundary = np.zeros((L,), dtype=np.float32)
     six = build_six_from_demo_sequence(obs, acts, boundary, prev_action_start=prev_action_start)
     return torch.from_numpy(six).float(), torch.from_numpy(acts).long()
-
 
 def maybe_augment_demo_six_cpu(p2_six_cpu: torch.Tensor, args) -> torch.Tensor:
     if not bool(getattr(args, "use_aug", False)):
@@ -120,10 +114,8 @@ def maybe_augment_demo_six_cpu(p2_six_cpu: torch.Tensor, args) -> torch.Tensor:
     x[:, 0:3, :, :] = imgs
     return torch.from_numpy(x).float()
 
-
 def select_demo_paths_for_task(recs_main, recs_syn, args, epoch: int) -> List[str]:
     paths = []
-    # main demos
     if recs_main and getattr(args, "max_main_demos_per_task", 0) > 0:
         try:
             main_paths = first_demo_paths(recs_main, args.demo_root)
@@ -131,7 +123,7 @@ def select_demo_paths_for_task(recs_main, recs_syn, args, epoch: int) -> List[st
             main_paths = first_demo_paths(recs_main)
         random.shuffle(main_paths)
         paths.extend(main_paths[: int(getattr(args, "max_main_demos_per_task", 0))])
-    # synthetic demos (gated by epoch)
+
     use_syn = bool(getattr(args, "syn_demo_root", None)) and (epoch >= int(getattr(args, "syn_demo_min_epoch", 3)))
     if use_syn and recs_syn and getattr(args, "max_syn_demos_per_task", 0) > 0:
         try:

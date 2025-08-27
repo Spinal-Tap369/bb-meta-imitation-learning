@@ -1,4 +1,4 @@
-# plastic_train/utils.py
+# mri_train/utils.py
 
 import os
 import json
@@ -19,13 +19,11 @@ SEQ_LEN = 500
 PAD_ACTION = -100
 MAX_VALIDATION_STEPS = 1000
 
-
 def apply_brightness_contrast(
     img_seq: np.ndarray,
     brightness_range=(0.85, 1.15),
     contrast_range=(0.85, 1.15),
 ):
-    """Random brightness and contrast adjustment on a sequence (T,C,H,W)."""
     b_factor = np.random.uniform(*brightness_range)
     c_factor = np.random.uniform(*contrast_range)
     seq = img_seq * b_factor
@@ -33,15 +31,11 @@ def apply_brightness_contrast(
     seq = (seq - mean) * c_factor + mean
     return np.clip(seq, 0.0, 1.0)
 
-
 def apply_gaussian_noise(img_seq: np.ndarray, std=0.02):
-    """Add Gaussian noise to a sequence (T,C,H,W)."""
     noise = np.random.normal(scale=std, size=img_seq.shape).astype(np.float32)
     return np.clip(img_seq + noise, 0.0, 1.0)
 
-
 def apply_spatial_jitter(img_seq: np.ndarray, max_shift=2):
-    """Apply integer pixel shifts within ±max_shift on H and W."""
     T, C, H, W = img_seq.shape
     shift_y = np.random.randint(-max_shift, max_shift + 1)
     shift_x = np.random.randint(-max_shift, max_shift + 1)
@@ -53,7 +47,6 @@ def apply_spatial_jitter(img_seq: np.ndarray, max_shift=2):
     jittered[:, :, dst_y1:dst_y2, dst_x1:dst_x2] = img_seq[:, :, src_y1:src_y2, src_x1:src_x2]
     return jittered
 
-
 def temporal_subsequence_and_pad(
     obs_six: np.ndarray,
     actions: np.ndarray,
@@ -63,22 +56,20 @@ def temporal_subsequence_and_pad(
     min_window=200,
     attempt_limit=10,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Random temporal crop with left-padding; preserves masks and boundary bit."""
     L_full = obs_six.shape[0]
     assert L_full == seq_len, "Expected full-length input for cropping logic"
-
     if (actions != PAD_ACTION).sum() == 0:
         return obs_six, actions, explore_mask, valid_mask
 
     for _ in range(attempt_limit):
         L = random.randint(min_window, seq_len)
         start = random.randint(0, seq_len - L)
-        window_actions = actions[start : start + L]
+        window_actions = actions[start:start+L]
         if (window_actions != PAD_ACTION).any():
-            obs_sub = obs_six[start : start + L]
-            act_sub = actions[start : start + L]
-            exp_sub = explore_mask[start : start + L]
-            val_sub = valid_mask[start : start + L]
+            obs_sub = obs_six[start:start+L]
+            act_sub = actions[start:start+L]
+            exp_sub = explore_mask[start:start+L]
+            val_sub = valid_mask[start:start+L]
 
             pad_len = seq_len - L
             C, H, W = obs_six.shape[1:]
@@ -97,11 +88,9 @@ def temporal_subsequence_and_pad(
                 first_idx = int(np.argmax(exploit_mask))
                 if np.all(new_obs[first_idx, 5] == 0.0):
                     new_obs[first_idx, 5, :, :] = 1.0
-
             return new_obs, new_actions, new_exp_mask, new_val_mask
 
     return obs_six, actions, explore_mask, valid_mask
-
 
 def smoothed_cross_entropy(
     logits: torch.Tensor,
@@ -109,25 +98,19 @@ def smoothed_cross_entropy(
     ignore_index: int = PAD_ACTION,
     smoothing: float = 0.0,
 ) -> torch.Tensor:
-    """Label-smoothed CE that ignores targets == ignore_index."""
     log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
     probs = torch.exp(log_probs)
-
     mask = targets != ignore_index
     if mask.sum().item() == 0:
         return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-
     targets_safe = torch.where(mask, targets, torch.zeros_like(targets))
     true_lp = torch.gather(log_probs, -1, targets_safe.unsqueeze(-1)).squeeze(-1)
     uni_lp = log_probs.mean(dim=-1)
     loss_tok = -(1.0 - smoothing) * true_lp - smoothing * uni_lp
-
     loss = (loss_tok * mask).sum() / mask.sum()
     return loss
 
-
 def make_task_id(task_dict: Dict) -> int:
-    """Compute a stable task identifier from task fields."""
     if "task_idx" in task_dict:
         return int(task_dict["task_idx"])
     key = (
@@ -140,14 +123,12 @@ def make_task_id(task_dict: Dict) -> int:
     )
     return abs(hash(key)) % (1 << 31)
 
-
 def build_six_from_demo_sequence(
     obs_rgb_seq: np.ndarray,
     action_seq: np.ndarray,
     boundary_mask: np.ndarray,
     prev_action_start: float = 0.0,
 ) -> np.ndarray:
-    """Build (T,6,H,W) from RGB (T,H,W,3) with prev-action, prev-reward, and boundary channels."""
     T, H, W, _ = obs_rgb_seq.shape
     six = []
     prev_action, prev_reward = prev_action_start, 0.0
@@ -160,17 +141,14 @@ def build_six_from_demo_sequence(
         prev_action = float(action_seq[t])
     return np.stack(six)
 
-
 def assemble_meta_sequence(
     explore_files: List[str],
     exploit_file: str,
     seq_len: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Assemble exploration + exploitation into fixed-length tensors."""
     parts_six, parts_act, parts_exp, parts_valid, parts_boundary = [], [], [], [], []
     prev_action = 0.0
 
-    # Exploration (unlabeled)
     total_explore_len = 0
     for ef in explore_files:
         d = np.load(ef)
@@ -178,24 +156,20 @@ def assemble_meta_sequence(
         L = len(acts)
         boundary = np.zeros((L,), dtype=np.float32)
         six = build_six_from_demo_sequence(obs, acts, boundary, prev_action)
-
         parts_six.append(six)
         parts_act.append(np.full((L,), PAD_ACTION, dtype=np.int64))
         parts_exp.append(np.ones((L,), dtype=np.float32))
         parts_valid.append(np.ones((L,), dtype=np.float32))
         parts_boundary.append(boundary)
-
         prev_action = float(acts[-1]) if L > 0 else prev_action
         total_explore_len += L
 
-    # Exploitation (labeled)
     de = np.load(exploit_file)
     obs_e, acts_e = de["observations"].astype(np.float32), de["actions"].astype(np.int64)
     L_e = len(acts_e)
     boundary_e = np.zeros((L_e,), dtype=np.float32)
     if L_e > 0:
         boundary_e[0] = 1.0
-
     six_e = build_six_from_demo_sequence(obs_e, acts_e, boundary_e, prev_action)
 
     parts_six.append(six_e)
@@ -204,7 +178,6 @@ def assemble_meta_sequence(
     parts_valid.append(np.ones((L_e,), dtype=np.float32))
     parts_boundary.append(boundary_e)
 
-    # Concatenate and pad/trim
     combined_six = np.concatenate(parts_six, axis=0)
     combined_act = np.concatenate(parts_act, axis=0)
     combined_exp = np.concatenate(parts_exp, axis=0)
@@ -232,11 +205,8 @@ def assemble_meta_sequence(
 
     return obs_six, actions, exp_mask, val_mask
 
-
 def load_all_manifests(demo_root: str) -> Dict[int, List[Dict]]:
-    """Load demo and DAgger manifests into {task_idx: [records]}."""
     demos: Dict[int, List[Dict]] = {}
-
     def _load(path):
         if not os.path.isfile(path):
             return
@@ -255,50 +225,40 @@ def load_all_manifests(demo_root: str) -> Dict[int, List[Dict]]:
                     "goal_y": row.get("goal_y"),
                 }
                 demos.setdefault(tid, []).append(rec)
-
     _load(os.path.join(demo_root, "demo_manifest.csv"))
     _load(os.path.join(demo_root, "dagger_manifest.csv"))
     return demos
 
-
 def eval_sampled_val(policy_net, val_task_entries, env, device, sample_n=3, max_steps=MAX_VALIDATION_STEPS):
-    """Roll out on sampled validation tasks and aggregate metrics.
-
-    Boundary channel (index 5) is 1.0 for all timesteps that occur in phase 2,
-    and 0.0 in phase 1. Start/goal are NOT randomized — they come from the task config.
-    """
     policy_net.eval()
     sampled = random.sample(val_task_entries, min(sample_n, len(val_task_entries)))
     results = []
-
     with torch.no_grad():
         pbar = tqdm(sampled, desc="validation", leave=False)
         for ex in pbar:
             tid = ex["task_id"]
             cfg = MazeTaskManager.TaskConfig(**ex["task_dict"])
-            env.unwrapped.set_task(cfg)  # fixed start/goal from train_trials.json
+            env.unwrapped.set_task(cfg)
 
             obs, _ = env.reset()
             done, trunc = False, False
             last_a, last_r = 0.0, 0.0
             steps = 0
             reached = False
-
-            states = []  # (t, 6, H, W)
+            states = []
 
             while not done and not trunc and steps < max_steps:
                 cur_p = env.unwrapped.maze_core.phase
-                bb = 1.0 if cur_p == 2 else 0.0  # persistent phase-2 boundary bit
-
-                img = obs.transpose(2, 0, 1).astype(np.float32)  # (3, H, W)
+                bb = 1.0 if cur_p == 2 else 0.0
+                img = obs.transpose(2, 0, 1).astype(np.float32)
                 H, W = img.shape[1], img.shape[2]
-                c3 = np.full((1, H, W), last_a, dtype=np.float32)  # prev action
-                c4 = np.full((1, H, W), last_r, dtype=np.float32)  # prev reward
-                c5 = np.full((1, H, W), bb,     dtype=np.float32)  # boundary bit
+                c3 = np.full((1, H, W), last_a, dtype=np.float32)
+                c4 = np.full((1, H, W), last_r, dtype=np.float32)
+                c5 = np.full((1, H, W), bb, dtype=np.float32)
                 obs6 = np.concatenate([img, c3, c4, c5], axis=0)
                 states.append(obs6)
 
-                seq = torch.from_numpy(np.stack(states, axis=0)[None]).float().to(device)  # (1, t, 6, H, W)
+                seq = torch.from_numpy(np.stack(states, axis=0)[None]).float().to(device)
                 logits, _ = policy_net.act_single_step(seq)
                 action = torch.distributions.Categorical(logits=logits).sample().item()
 
@@ -321,14 +281,8 @@ def eval_sampled_val(policy_net, val_task_entries, env, device, sample_n=3, max_
                 trans = True
 
             results.append(
-                {
-                    "task_id": tid,
-                    "phase1": p1,
-                    "phase2": p2,
-                    "success": succ,
-                    "total_steps": total,
-                    "transition_issue": trans,
-                }
+                {"task_id": tid, "phase1": p1, "phase2": p2, "success": succ,
+                 "total_steps": total, "transition_issue": trans}
             )
             pbar.set_postfix(task=tid, p1=p1, p2=p2, succ=succ)
 
@@ -347,24 +301,22 @@ def eval_sampled_val(policy_net, val_task_entries, env, device, sample_n=3, max_
         float(np.mean(succs)),
     )
 
-import logging, os, sys
-import torch
-
+import logging as _logging, sys as _sys
 def _setup_logging(log_file: str | None, level: str):
-    root = logging.getLogger()
+    root = _logging.getLogger()
     for h in list(root.handlers):
         root.removeHandler(h)
-    fmt_console = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
-    console = logging.StreamHandler(sys.stdout)
+    fmt_console = _logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    console = _logging.StreamHandler(_sys.stdout)
     console.setFormatter(fmt_console)
     root.addHandler(console)
     if log_file:
         os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
-        fmt_file = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        fileh = logging.FileHandler(log_file, mode="a")
+        fmt_file = _logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        fileh = _logging.FileHandler(log_file, mode="a")
         fileh.setFormatter(fmt_file)
         root.addHandler(fileh)
-    lvl = getattr(logging, level.upper(), logging.INFO)
+    lvl = getattr(_logging, level.upper(), _logging.INFO)
     root.setLevel(lvl)
 
 def _cuda_mem(prefix: str, device):

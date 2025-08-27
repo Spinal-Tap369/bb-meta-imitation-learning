@@ -1,4 +1,4 @@
-# plastic_train/__init__.py
+# mri_train/__init__.py
 
 """
 BC Meta-Imitation training (SNAIL) — Vectorized exploration

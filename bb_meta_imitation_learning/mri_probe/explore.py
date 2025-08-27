@@ -1,4 +1,4 @@
-# plastic_train/explore.py
+# mri_train/explore.py
 
 from dataclasses import dataclass
 from typing import List, Optional, Dict
@@ -40,7 +40,6 @@ def _make_env_fn_with_task(task_cfg: MazeTaskManager.TaskConfig):
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
         os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp")
-        os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
         env = make_base_env()
         env.unwrapped.set_task(task_cfg)
         env = Phase1ShapingWrapper(env)  # shaping only affects phase-1
@@ -60,20 +59,12 @@ def collect_explore_vec(
         return []
     vec_env = gym.vector.AsyncVectorEnv([_make_env_fn_with_task(cfg) for cfg in task_cfgs], shared_memory=False)
 
-    if dbg:
-        try:
-            is_async = isinstance(vec_env, gym.vector.AsyncVectorEnv)
-        except Exception:
-            is_async = "AsyncVectorEnv" in type(vec_env).__name__
-        logger.info(f"[VEC] created {type(vec_env).__name__} async={bool(is_async)} num_envs={getattr(vec_env,'num_envs',n)}")
-
     t0_total = _time.time()
     t_env = 0.0
     t_net = 0.0
     fwd_calls_total = 0
     fwd_calls_batched = 0
     fwd_batch_size_accum = 0
-    b_alive_hist: Dict[int, int] = {}
 
     try:
         try:
@@ -122,17 +113,12 @@ def collect_explore_vec(
 
             t_net_start = _time.time()
             B_alive = len(alive_indices)
-            b_alive_hist[B_alive] = b_alive_hist.get(B_alive, 0) + 1
             T_lens = [steps_i[i] + 1 for i in alive_indices]
             T_max = max(T_lens)
             batch_seq = torch.zeros((B_alive, T_max, 6, H, W), device=device, dtype=torch.float32)
             for bi, i in enumerate(alive_indices):
                 t = T_lens[bi]
                 batch_seq[bi, -t:, :, :, :] = states_buf[i][:t]
-
-            if hasattr(policy_net, "reset_plastic"):
-                policy_net.reset_plastic(batch_size=B_alive, device=device)
-                policy_net.set_plastic(update_traces=False, modulators=None)
 
             with torch.inference_mode():
                 logits_batch, _ = policy_net(batch_seq)
@@ -203,39 +189,3 @@ def collect_explore_vec(
             vec_env.close()
         except Exception:
             pass
-
-def recollect_batch_for_sign(
-    policy_net: torch.nn.Module,
-    per_task_tensors: Dict[int, Dict[str, torch.Tensor]],
-    tasks_used: List[int],
-    device: torch.device,
-    seed_base: int,
-    vec_cap: int,
-    dbg: bool = False,
-    dbg_timing: bool = False,
-    dbg_level: str = "WARNING",
-    log_info: bool = False,
-    sign_label: str = "",
-) -> Dict[int, ExploreRollout]:
-    ros_by_tid: Dict[int, ExploreRollout] = {}
-    if not tasks_used:
-        return ros_by_tid
-    all_cfgs = [MazeTaskManager.TaskConfig(**per_task_tensors[tid]["task_dict"]) for tid in tasks_used]
-    step = max(1, int(vec_cap))
-    for off in range(0, len(all_cfgs), step):
-        cfgs = all_cfgs[off: off + step]
-        slice_tids = tasks_used[off: off + step]
-        if log_info:
-            import logging
-            logging.getLogger(__name__).info(
-                "[COLLECT][ES%s] chunk=%d..%d/%d vec_cap=%d seed_base=%d tasks=%s",
-                sign_label, off, off + len(cfgs) - 1, len(all_cfgs) - 1, step, seed_base + off, slice_tids
-            )
-        ro_list = collect_explore_vec(
-            policy_net, cfgs, device, max_steps=250,
-            seed_base=seed_base + off,
-            dbg=dbg, dbg_timing=dbg_timing, dbg_level=dbg_level
-        )
-        for tid, ro in zip(slice_tids, ro_list):
-            ros_by_tid[tid] = ro
-    return ros_by_tid
