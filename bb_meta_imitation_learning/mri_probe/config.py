@@ -130,4 +130,11 @@ def parse_args():
     p.add_argument("--debug_timing", action="store_true")
     p.add_argument("--debug_shapes", action="store_true")
 
+    p.add_argument("--stale_probe_every", type=int, default=0,
+                   help="Probe cadence in step units inside each batch (0=disabled). "
+                        "E.g., 8 or 16 to check drift every N outer steps.")
+    p.add_argument("--stale_probe_K", type=int, default=0,
+                   help="Optional per-task timestep subsample for the probe (0=use full Episode-1 window). "
+                        "Use 128–256 to cheapen the probe when sequences are long.")
+
     return p.parse_args()

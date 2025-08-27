@@ -364,6 +364,7 @@ def run_training():
             end = min(len(train_tasks), (b + 1) * args.batch_size)
             batch_ids = [batch_indices[i] for i in range(start, end)]
             batch_tasks = [train_tasks[i] for i in batch_ids]
+            task_by_id = {t["task_id"]: t for t in batch_tasks}
 
             # next-batch NPZ prefetch (CPU)
             if int(getattr(args, "prefetch_batches", 1)) > 0 and (b + 1) < num_batches:
@@ -388,11 +389,11 @@ def run_training():
                     except Exception as e:
                         logger.warning("[PREFETCH][NPZ] failed: %s", repr(e))
 
-            # collect explores where needed
+            # collect explores where needed (base recollect for new/overused)
             need_collect = []
             for task in batch_tasks:
                 tid = task["task_id"]
-                if tid not in explore_cache or explore_cache[tid].reuse_count >= args.explore_reuse_M:
+                if tid not in explore_cache or getattr(explore_cache[tid], "reuse_count", 0) >= args.explore_reuse_M:
                     need_collect.append(task)
 
             _vec_cap = int(getattr(args, "num_envs", 8))
@@ -409,23 +410,122 @@ def run_training():
                                               seed_base=seed_here, dbg=False)
                 for ttask, ro in zip(slice_tasks, ro_list):
                     explore_cache[ttask["task_id"]] = ro
+                    try:
+                        ro.reuse_count = 0
+                    except Exception:
+                        pass
 
-            # Build per-task tensors (CPU now; H2D together later)
+            # ============== TWO-PASS BATCH PREP ==============
+            # PASS 1 — compute KL/ESS vs current policy (stacked forward) & decide early refresh
+            kls, esss, rmu, rsd, rmx = [], [], [], [], []
+            stale_by_kl: List[int] = []
+            stale_by_ess: List[int] = []
+
+            # Build pad-batched Episode-1 tensors for current batch
+            exps, behs, acts, lens, tids_order = [], [], [], [], []
+            for task in batch_tasks:
+                tid = task["task_id"]
+                ro = explore_cache.get(tid)
+                if ro is None:
+                    cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
+                    ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
+                                             seed_base=args.seed + 424242, dbg=False).pop()
+                    explore_cache[tid] = ro
+                exps.append(ro.obs6)
+                behs.append(ro.beh_logits)
+                acts.append(ro.actions)
+                lens.append(int(ro.obs6.shape[0]))
+                tids_order.append(tid)
+
+            if len(exps) == 0:
+                continue
+
+            B = len(exps)
+            T_max = max(lens)
+            C, H, W = exps[0].shape[1:]
+            A = behs[0].shape[1]
+            # Pad to (B,T_max,...) on device for a single forward
+            exp_b = torch.zeros(B, T_max, C, H, W, device=device)
+            beh_b = torch.zeros(B, T_max, A, device=device)
+            act_b = torch.full((B, T_max), -1, dtype=torch.long, device=device)
+            for i in range(B):
+                tlen = lens[i]
+                if tlen == 0: continue
+                exp_b[i, :tlen] = exps[i].to(device, non_blocking=True)
+                beh_b[i, :tlen] = behs[i].to(device, non_blocking=True)
+                act_b[i, :tlen] = acts[i].to(device, non_blocking=True)
+
+            with torch.no_grad(), autocast(device_type="cuda", enabled=use_amp):
+                logits_now_b, _ = policy_net(exp_b)  # (B, T_max, A)
+
+            # Per-task metrics
+            for i in range(B):
+                tlen = lens[i]
+                if tlen == 0:
+                    kls.append(0.0); esss.append(1.0); rmu.append(1.0); rsd.append(0.0); rmx.append(1.0)
+                    continue
+                li = logits_now_b[i, :tlen]
+                bi = beh_b[i, :tlen]
+                ai = act_b[i, :tlen]
+                lp_now = torch.log_softmax(li, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)
+                lp_beh = torch.log_softmax(bi, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)
+                rhos = torch.exp(lp_now - lp_beh)
+                if getattr(args, "is_clip_rho", 0.0) > 0:
+                    rhos = torch.clamp(rhos, max=args.is_clip_rho)
+                ess_ratio_val = ess_ratio_from_rhos(rhos).item()
+                kl_val = mean_kl_logits(li, bi).item()
+
+                kls.append(kl_val); esss.append(ess_ratio_val)
+                rmu.append(float(rhos.mean().item()))
+                rsd.append(float(rhos.std(unbiased=False).item()))
+                rmx.append(float(rhos.max().item()))
+
+                tid = tids_order[i]
+                if kl_val > args.kl_refresh_threshold:
+                    stale_by_kl.append(tid)
+                if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
+                    if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio_val < args.ess_refresh_ratio:
+                        stale_by_ess.append(tid)
+
+            # Vectorized early refresh (union of stale)
+            kl_refresh_count = len(stale_by_kl)
+            ess_refresh_count = len(stale_by_ess)
+            early_stale_tids = sorted(set(stale_by_kl) | set(stale_by_ess))
+            if early_stale_tids:
+                logger.info("[COLLECT][EARLY-REFRESH] epoch=%d batch=%d stale=%d (KL>%g: %d, ESS<%g: %d)",
+                            epoch, b + 1, len(early_stale_tids),
+                            float(args.kl_refresh_threshold), kl_refresh_count,
+                            float(args.ess_refresh_ratio), ess_refresh_count)
+                vec_cap = int(getattr(args, "num_envs", 8))
+                for off in range(0, len(early_stale_tids), max(1, vec_cap)):
+                    tids_slice = early_stale_tids[off: off + max(1, vec_cap)]
+                    cfgs = [MazeTaskManager.TaskConfig(**task_by_id[tid]["task_dict"]) for tid in tids_slice]
+                    seed_here = args.seed + 800000 + 1000 * b + off
+                    ro_list = collect_explore_vec(policy_net, cfgs, device, max_steps=250,
+                                                  seed_base=seed_here, dbg=False)
+                    for tid, ro_new in zip(tids_slice, ro_list):
+                        explore_cache[tid] = ro_new
+                        try:
+                            ro_new.reuse_count = 0
+                        except Exception:
+                            pass
+
+            # free forward tensors
+            del exp_b, beh_b, act_b, logits_now_b
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            # PASS 2 — build per-task BC supervision tensors (using possibly refreshed rollouts)
             per_task_tensors: Dict[int, Dict[str, torch.Tensor]] = {}
             tasks_used: List[int] = []
 
-            batch_kl_vals, batch_ess_vals = [], []
-            batch_rho_mean, batch_rho_std, batch_rho_max = [], [], []
-            kl_refresh_count = 0
-            ess_refresh_count = 0
-
             for task in batch_tasks:
                 tid = task["task_id"]
-                cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
-                ro = explore_cache.get(tid, None)
+                ro = explore_cache.get(tid)
                 if ro is None:
-                    seed_here = args.seed + 424242
-                    ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250, seed_base=seed_here, dbg=False).pop()
+                    cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
+                    ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
+                                             seed_base=args.seed + 777777, dbg=False).pop()
                     explore_cache[tid] = ro
 
                 exp_six_cpu = ro.obs6
@@ -433,54 +533,6 @@ def run_training():
                 rewards_cpu = ro.rewards
                 beh_logits_cpu = ro.beh_logits
                 Tx = exp_six_cpu.shape[0]
-
-                # stats vs current policy (AMP + no_grad)
-                with torch.no_grad():
-                    with autocast(device_type="cuda", enabled=use_amp):
-                        logits_now_tmp, _ = policy_net(exp_six_cpu.unsqueeze(0).to(device, non_blocking=True))
-                        logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
-                    lp_cur = torch.log_softmax(logits_now_tmp, dim=-1).gather(1, actions_cpu.to(device, non_blocking=True).unsqueeze(1)).squeeze(1)
-                    lp_beh = torch.log_softmax(beh_logits_cpu.to(device, non_blocking=True), dim=-1).gather(1, actions_cpu.to(device, non_blocking=True).unsqueeze(1)).squeeze(1)
-                    rhos = torch.exp(lp_cur - lp_beh)
-                    if getattr(args, "is_clip_rho", 0.0) > 0:
-                        rhos = torch.clamp(rhos, max=args.is_clip_rho)
-                    ess_ratio_val = ess_ratio_from_rhos(rhos).item()
-                    kl_val = mean_kl_logits(logits_now_tmp, beh_logits_cpu.to(device, non_blocking=True)).item()
-                    del logits_now_tmp
-
-                batch_kl_vals.append(kl_val)
-                batch_ess_vals.append(ess_ratio_val)
-                batch_rho_mean.append(float(rhos.mean().item()))
-                batch_rho_std.append(float(rhos.std(unbiased=False).item()))
-                batch_rho_max.append(float(rhos.max().item()))
-
-                if kl_val > args.kl_refresh_threshold:
-                    kl_refresh_count += 1
-                    seed_here = args.seed + 999999
-                    ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250, seed_base=seed_here, dbg=False).pop()
-                    explore_cache[tid] = ro
-                    exp_six_cpu = ro.obs6; actions_cpu = ro.actions; rewards_cpu = ro.rewards; beh_logits_cpu = ro.beh_logits
-                    Tx = exp_six_cpu.shape[0]
-                    with torch.no_grad():
-                        with autocast(device_type="cuda", enabled=use_amp):
-                            logits_now_tmp, _ = policy_net(exp_six_cpu.unsqueeze(0).to(device, non_blocking=True))
-                            logits_now_tmp = logits_now_tmp[0] if logits_now_tmp.dim() == 3 else logits_now_tmp
-                        lp_cur = torch.log_softmax(logits_now_tmp, dim=-1).gather(1, actions_cpu.to(device, non_blocking=True).unsqueeze(1)).squeeze(1)
-                        lp_beh = torch.log_softmax(beh_logits_cpu.to(device, non_blocking=True), dim=-1).gather(1, actions_cpu.to(device, non_blocking=True).unsqueeze(1)).squeeze(1)
-                        rhos = torch.exp(lp_cur - lp_beh)
-                        if getattr(args, "is_clip_rho", 0.0) > 0:
-                            rhos = torch.clamp(rhos, max=args.is_clip_rho)
-                        ess_ratio_val = ess_ratio_from_rhos(rhos).item()
-                        del logits_now_tmp
-
-                if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
-                    if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio_val < args.ess_refresh_ratio:
-                        ess_refresh_count += 1
-                        seed_here = args.seed + 31337
-                        ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250, seed_base=seed_here, dbg=False).pop()
-                        explore_cache[tid] = ro
-                        exp_six_cpu = ro.obs6; actions_cpu = ro.actions; rewards_cpu = ro.rewards; beh_logits_cpu = ro.beh_logits
-                        Tx = exp_six_cpu.shape[0]
 
                 # Build batched BC tensors from selected demos (CPU -> pad)
                 prev_action_start = float(actions_cpu[-1].item()) if Tx > 0 else 0.0
@@ -538,12 +590,12 @@ def run_training():
                         t["beh_logits_dev"] = t["beh_logits_cpu"].to(device, non_blocking=True)
                 torch.cuda.current_stream().wait_stream(copy_stream)
 
-            # Batch indicators
-            s_kl  = _stats_from_list(batch_kl_vals)
-            s_ess = _stats_from_list(batch_ess_vals)
-            s_rmu = _stats_from_list(batch_rho_mean)
-            s_rsd = _stats_from_list(batch_rho_std)
-            s_rmx = _stats_from_list(batch_rho_max)
+            # Batch indicators (use stats from PASS 1)
+            s_kl  = _stats_from_list(kls)
+            s_ess = _stats_from_list(esss)
+            s_rmu = _stats_from_list(rmu)
+            s_rsd = _stats_from_list(rsd)
+            s_rmx = _stats_from_list(rmx)
             logger.info(
                 "[IND][BATCH %d/%d] tasks=%d | %s | ESS:%s | rho(mean):%s rho(std):%s rho(max):%s | refresh: KL=%d ESS=%d",
                 b + 1, num_batches, len(tasks_used),
@@ -704,7 +756,7 @@ def run_training():
                 # bookkeeping
                 for tid in tasks_used:
                     try:
-                        explore_cache[tid].reuse_count += 1
+                        explore_cache[tid].reuse_count = getattr(explore_cache[tid], "reuse_count", 0) + 1
                     except Exception:
                         pass
 
@@ -722,11 +774,12 @@ def run_training():
                     float(grad_norm if torch.is_tensor(grad_norm) else grad_norm),
                 )
 
-                # --- Mid-batch staleness probe (KL/ESS) & targeted recollect ---
-                probe_every = int(getattr(args, "stale_probe_every", 16) or 0)
-                probe_K     = int(getattr(args, "stale_probe_K", 128) or 0)
+                # --- Mid-batch staleness probe (KL/ESS) & targeted recollect (VECTORIZED) ---
+                probe_every = int(getattr(args, "stale_probe_every", 0) or 0)
+                probe_K     = int(getattr(args, "stale_probe_K", 0) or 0)
                 if probe_every > 0 and ((step_idx + 1) % probe_every == 0):
                     tids_to_check = list(tasks_used)
+
                     # Build selected (possibly truncated/subsampled) sequences per task
                     exps_sel, behs_sel, acts_sel, lens_sel, task_order = [], [], [], [], []
                     for tid in tids_to_check:
@@ -736,7 +789,7 @@ def run_training():
                         if args.adapt_trunc_T is not None and isinstance(args.adapt_trunc_T, int) and exp.shape[0] > args.adapt_trunc_T:
                             exp = exp[-args.adapt_trunc_T:]; beh = beh[-args.adapt_trunc_T:]; act = act[-args.adapt_trunc_T:]
                         Tlen = exp.shape[0]
-                        if Tlen == 0:  # safety
+                        if Tlen == 0:
                             continue
                         if probe_K > 0 and Tlen > probe_K:
                             idx = torch.randperm(Tlen, device=device)[:probe_K].sort()[0]
@@ -747,21 +800,21 @@ def run_training():
                         exps_sel.append(exp); behs_sel.append(beh); acts_sel.append(act); lens_sel.append(Tlen); task_order.append(tid)
 
                     if lens_sel:
-                        B = len(exps_sel)
-                        T_max = max(lens_sel)
+                        Bp = len(exps_sel)
+                        Tp = max(lens_sel)
                         C, H, W = exps_sel[0].shape[1:]
                         A = behs_sel[0].shape[1]
-                        exp_b = torch.zeros(B, T_max, C, H, W, device=device)
-                        beh_b = torch.zeros(B, T_max, A, device=device)
-                        act_b = torch.full((B, T_max), -1, dtype=torch.long, device=device)
-                        for i in range(B):
+                        exp_pb = torch.zeros(Bp, Tp, C, H, W, device=device)
+                        beh_pb = torch.zeros(Bp, Tp, A, device=device)
+                        act_pb = torch.full((Bp, Tp), -1, dtype=torch.long, device=device)
+                        for i in range(Bp):
                             tlen = lens_sel[i]
-                            exp_b[i, :tlen] = exps_sel[i]
-                            beh_b[i, :tlen] = behs_sel[i]
-                            act_b[i, :tlen] = acts_sel[i]
+                            exp_pb[i, :tlen] = exps_sel[i]
+                            beh_pb[i, :tlen] = behs_sel[i]
+                            act_pb[i, :tlen] = acts_sel[i]
 
                         with torch.no_grad(), autocast(device_type="cuda", enabled=use_amp):
-                            logits_now_b, _ = policy_net(exp_b)  # (B,T,A)
+                            logits_now_b, _ = policy_net(exp_pb)  # (B,T,A)
 
                         # Per-task KL/ESS and decision
                         stale_tids: List[int] = []
@@ -769,8 +822,8 @@ def run_training():
                         for i, tid in enumerate(task_order):
                             tlen = lens_sel[i]
                             li = logits_now_b[i, :tlen]
-                            bi = beh_b[i, :tlen]
-                            ai = act_b[i, :tlen]
+                            bi = beh_pb[i, :tlen]
+                            ai = act_pb[i, :tlen]
 
                             lp_now = torch.log_softmax(li, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)
                             lp_beh = torch.log_softmax(bi, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)
@@ -809,7 +862,7 @@ def run_training():
                                     )
 
                         # free batch probes
-                        del exp_b, beh_b, act_b, logits_now_b
+                        del exp_pb, beh_pb, act_pb, logits_now_b
                         if device.type == "cuda":
                             torch.cuda.empty_cache()
 
