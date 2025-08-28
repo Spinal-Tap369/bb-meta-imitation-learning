@@ -1,7 +1,8 @@
 # mri_train/train.py
 
 import os, sys, json, math, random, logging, gc
-from typing import Dict, List, Optional, Tuple, OrderedDict
+from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -62,7 +63,10 @@ except Exception:
 
 # ---------- helpers ----------
 
-def _pad_and_stack_cpu(obs_list: List[torch.Tensor], lab_list: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+def _pad_and_stack_cpu(
+    obs_list: List[torch.Tensor],
+    lab_list: List[torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pad to common T on CPU and stack -> (B, T, 6,H,W), (B, T)."""
     B = len(obs_list)
     T_max = max(x.shape[0] for x in obs_list)
@@ -78,27 +82,33 @@ def _pad_and_stack_cpu(obs_list: List[torch.Tensor], lab_list: List[torch.Tensor
         pad_lab.append(y)
     return torch.stack(pad_obs, dim=0), torch.stack(pad_lab, dim=0)
 
+
 def _named_trainable(module: nn.Module) -> "OrderedDict[str, torch.nn.Parameter]":
-    from collections import OrderedDict
     return OrderedDict((n, p) for n, p in module.named_parameters() if p.requires_grad)
 
-def _functional_bc_loss_at_phi(model: nn.Module,
-                               params_phi: Dict[str, torch.Tensor],
-                               batch_obs: torch.Tensor,
-                               batch_lab: torch.Tensor,
-                               smoothing: float,
-                               use_amp: bool):
-    """
-    Stateless forward at adapted parameters φ to compute BC loss.
-    """
+
+def _functional_bc_loss_at_phi(
+    model: nn.Module,
+    params_phi: Dict[str, torch.Tensor],
+    batch_obs: torch.Tensor,
+    batch_lab: torch.Tensor,
+    smoothing: float,
+    use_amp: bool
+):
+    """Stateless forward at adapted parameters φ to compute BC loss."""
     try:
         with autocast(device_type="cuda", enabled=use_amp):
             logits_phi, _ = _functional_call(model, params_phi, (batch_obs,))
             if smoothing > 0.0:
-                loss_bc_phi = smoothed_cross_entropy(logits_phi, batch_lab, ignore_index=PAD_ACTION, smoothing=smoothing)
+                loss_bc_phi = smoothed_cross_entropy(
+                    logits_phi, batch_lab, ignore_index=PAD_ACTION, smoothing=smoothing
+                )
             else:
                 ce = torch.nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
-                loss_bc_phi = ce(logits_phi.reshape(-1, logits_phi.size(-1)), batch_lab.reshape(-1))
+                loss_bc_phi = ce(
+                    logits_phi.reshape(-1, logits_phi.size(-1)),
+                    batch_lab.reshape(-1)
+                )
         return loss_bc_phi
     except Exception:
         # Fallback: load params in-place (slow, but robust), then restore.
@@ -111,68 +121,18 @@ def _functional_bc_loss_at_phi(model: nn.Module,
             with autocast(device_type="cuda", enabled=use_amp):
                 logits_phi, _ = model(batch_obs)
                 if smoothing > 0.0:
-                    loss_bc_phi = smoothed_cross_entropy(logits_phi, batch_lab, ignore_index=PAD_ACTION, smoothing=smoothing)
+                    loss_bc_phi = smoothed_cross_entropy(
+                        logits_phi, batch_lab, ignore_index=PAD_ACTION, smoothing=smoothing
+                    )
                 else:
                     ce = torch.nn.CrossEntropyLoss(ignore_index=PAD_ACTION)
-                    loss_bc_phi = ce(logits_phi.reshape(-1, logits_phi.size(-1)), batch_lab.reshape(-1))
+                    loss_bc_phi = ce(
+                        logits_phi.reshape(-1, logits_phi.size(-1)),
+                        batch_lab.reshape(-1)
+                    )
             return loss_bc_phi
         finally:
             model.load_state_dict(sd_backup, strict=False)
-
-def _rebuild_task_entry_from_ro(entry: Dict[str, torch.Tensor],
-                                ro: ExploreRollout,
-                                device: torch.device,
-                                args,
-                                npz_cache: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> Dict[str, torch.Tensor]:
-    """Rebuild explore+exploit tensors for a task entry after a fresh recollect."""
-    exp_six_cpu = ro.obs6
-    actions_cpu = ro.actions
-    rewards_cpu = ro.rewards
-    beh_logits_cpu = ro.beh_logits
-    Tx = exp_six_cpu.shape[0]
-    prev_action_start = float(actions_cpu[-1].item()) if Tx > 0 else 0.0
-
-    demo_obs_list: List[torch.Tensor] = []
-    demo_lab_list: List[torch.Tensor] = []
-    for demo_path in entry["selected_paths"]:
-        pre = npz_cache.pop(demo_path, None)
-        p2_six, p2_labels = load_phase2_six_and_labels(demo_path, prev_action_start=prev_action_start, preloaded=pre)
-        if p2_six.numel() == 0:
-            continue
-        p2_six = maybe_augment_demo_six_cpu(p2_six, args)
-        obs6_cat, labels_cat = concat_explore_and_exploit(exp_six_cpu, p2_six, p2_labels)
-        demo_obs_list.append(obs6_cat)
-        demo_lab_list.append(labels_cat)
-
-    if len(demo_obs_list) == 0:
-        # Nothing to supervise; keep explore cache but don't touch tensors.
-        entry["ro"] = ro
-        return entry
-
-    batch_obs_cpu, batch_lab_cpu = _pad_and_stack_cpu(demo_obs_list, demo_lab_list)
-    if getattr(args, "pin_memory", False):
-        # Only pin the short-lived batch tensors
-        batch_obs_cpu = batch_obs_cpu.pin_memory()
-        batch_lab_cpu = batch_lab_cpu.pin_memory()
-
-    entry.update({
-        "batch_obs_cpu": batch_obs_cpu,
-        "batch_lab_cpu": batch_lab_cpu,
-        "exp_cpu": exp_six_cpu,
-        "actions_cpu": actions_cpu,
-        "rewards_cpu": rewards_cpu,
-        "beh_logits_cpu": beh_logits_cpu,
-        "ro": ro,
-    })
-
-    # Refresh device copies immediately (no need to wait for the next copy-stream)
-    entry["batch_obs_dev"]   = batch_obs_cpu.to(device, non_blocking=True)
-    entry["batch_lab_dev"]   = batch_lab_cpu.to(device, non_blocking=True)
-    entry["exp_dev"]         = exp_six_cpu.to(device, non_blocking=True)
-    entry["actions_dev"]     = actions_cpu.to(device, non_blocking=True)
-    entry["rewards_dev"]     = rewards_cpu.to(device, non_blocking=True)
-    entry["beh_logits_dev"]  = beh_logits_cpu.to(device, non_blocking=True)
-    return entry
 
 
 # ---------- main ----------
@@ -185,7 +145,7 @@ def run_training():
     args = parse_args()
 
     # Logging / threads
-    chosen_level = (args.log_level or args.debug_level or ("DEBUG" if args.debug else "INFO")).upper()
+    chosen_level = (args.log_level or getattr(args, "debug_level", None) or ("DEBUG" if getattr(args, "debug", False) else "INFO")).upper()
     _setup_logging(log_file=args.log_file, level=chosen_level)
     torch.set_num_threads(getattr(args, "cpu_threads", min(16, os.cpu_count() or 8)))
     os.environ.setdefault("OMP_NUM_THREADS", str(torch.get_num_threads()))
@@ -205,6 +165,13 @@ def run_training():
     use_amp = device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
     logger.info("[DEVICE] device=%s amp=%s %s", device.type, str(use_amp), _cuda_mem("init", device))
+
+    # Log inner IS reference choice (defaults to θ_init if missing in config)
+    inner_is_ref = str(getattr(args, "inner_is_ref", "theta_init"))
+    logger.info("[MRI] inner_use_is=%s | inner_is_ref=%s | inner_ess_min=%.3f",
+                str(bool(getattr(args, "inner_use_is", False))),
+                inner_is_ref,
+                float(getattr(args, "inner_ess_min", 0.0) or 0.0))
 
     # Load tasks
     with open(args.train_trials) as f:
@@ -364,36 +331,13 @@ def run_training():
             end = min(len(train_tasks), (b + 1) * args.batch_size)
             batch_ids = [batch_indices[i] for i in range(start, end)]
             batch_tasks = [train_tasks[i] for i in batch_ids]
-            task_by_id = {t["task_id"]: t for t in batch_tasks}
 
-            # next-batch NPZ prefetch (CPU)
-            if int(getattr(args, "prefetch_batches", 1)) > 0 and (b + 1) < num_batches:
-                nstart = (b + 1) * args.batch_size
-                nend = min(len(train_tasks), (b + 2) * args.batch_size)
-                next_ids = [batch_indices[i] for i in range(nstart, nend)]
-                next_tasks = [train_tasks[i] for i in next_ids]
-                prefetch_paths: List[str] = []
-                for nt in next_tasks:
-                    sel = _select_demo_paths_for_task(nt.get("recs_main", []), nt.get("recs_syn", []), args, epoch=epoch)
-                    prefetch_paths.extend(sel)
-                futs = []
-                for pth in prefetch_paths:
-                    if pth in npz_cache:
-                        continue
-                    futs.append(cpu_pool.submit(_safe_npz_load_obs_acts, pth))
-                for fut in futs:
-                    try:
-                        pth, obs, acts = fut.result()
-                        if (obs is not None) and (acts is not None):
-                            npz_cache[pth] = (obs, acts)
-                    except Exception as e:
-                        logger.warning("[PREFETCH][NPZ] failed: %s", repr(e))
-
-            # collect explores where needed (base recollect for new/overused)
+            # ----------- Base collect (no mid-batch recollects; reuse == nbc) -----------
+            reuse_cap = max(1, int(getattr(args, "nbc", 1)))
             need_collect = []
             for task in batch_tasks:
                 tid = task["task_id"]
-                if tid not in explore_cache or getattr(explore_cache[tid], "reuse_count", 0) >= args.explore_reuse_M:
+                if tid not in explore_cache or getattr(explore_cache[tid], "reuse_count", 0) >= reuse_cap:
                     need_collect.append(task)
 
             _vec_cap = int(getattr(args, "num_envs", 8))
@@ -416,10 +360,8 @@ def run_training():
                         pass
 
             # ============== TWO-PASS BATCH PREP ==============
-            # PASS 1 — compute KL/ESS vs current policy (stacked forward) & decide early refresh
+            # PASS 1 — single stacked forward for metrics and FREE θ_init caching
             kls, esss, rmu, rsd, rmx = [], [], [], [], []
-            stale_by_kl: List[int] = []
-            stale_by_ess: List[int] = []
 
             # Build pad-batched Episode-1 tensors for current batch
             exps, behs, acts, lens, tids_order = [], [], [], [], []
@@ -456,77 +398,49 @@ def run_training():
                 act_b[i, :tlen] = acts[i].to(device, non_blocking=True)
 
             with torch.no_grad(), autocast(device_type="cuda", enabled=use_amp):
-                logits_now_b, _ = policy_net(exp_b)  # (B, T_max, A)
+                logits_now_b, _ = policy_net(exp_b)  # (B, T_max, A) — THIS IS θ_init
 
-            # Per-task metrics
-            for i in range(B):
+            # Metrics + FREE cache of lp_init (per tid, CPU)
+            lp_init_by_tid: Dict[int, torch.Tensor] = {}
+            for i, tid in enumerate(tids_order):
                 tlen = lens[i]
                 if tlen == 0:
                     kls.append(0.0); esss.append(1.0); rmu.append(1.0); rsd.append(0.0); rmx.append(1.0)
+                    lp_init_by_tid[tid] = torch.empty((0,), device="cpu")
                     continue
                 li = logits_now_b[i, :tlen]
                 bi = beh_b[i, :tlen]
                 ai = act_b[i, :tlen]
-                lp_now = torch.log_softmax(li, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)
-                lp_beh = torch.log_softmax(bi, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)
+
+                lp_now = torch.log_softmax(li, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)  # θ_init
+                lp_beh = torch.log_softmax(bi, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)  # behavior
+
                 rhos = torch.exp(lp_now - lp_beh)
                 if getattr(args, "is_clip_rho", 0.0) > 0:
                     rhos = torch.clamp(rhos, max=args.is_clip_rho)
+
                 ess_ratio_val = ess_ratio_from_rhos(rhos).item()
                 kl_val = mean_kl_logits(li, bi).item()
-
                 kls.append(kl_val); esss.append(ess_ratio_val)
                 rmu.append(float(rhos.mean().item()))
                 rsd.append(float(rhos.std(unbiased=False).item()))
                 rmx.append(float(rhos.max().item()))
 
-                tid = tids_order[i]
-                if kl_val > args.kl_refresh_threshold:
-                    stale_by_kl.append(tid)
-                if args.ess_refresh_ratio and args.ess_refresh_ratio > 0:
-                    if int(getattr(args, "explore_reuse_M", 1)) > 1 and ess_ratio_val < args.ess_refresh_ratio:
-                        stale_by_ess.append(tid)
+                # FREE θ_init ref for this tid (store on CPU; move later)
+                lp_init_by_tid[tid] = lp_now.detach().cpu()
 
-            # Vectorized early refresh (union of stale)
-            kl_refresh_count = len(stale_by_kl)
-            ess_refresh_count = len(stale_by_ess)
-            early_stale_tids = sorted(set(stale_by_kl) | set(stale_by_ess))
-            if early_stale_tids:
-                logger.info("[COLLECT][EARLY-REFRESH] epoch=%d batch=%d stale=%d (KL>%g: %d, ESS<%g: %d)",
-                            epoch, b + 1, len(early_stale_tids),
-                            float(args.kl_refresh_threshold), kl_refresh_count,
-                            float(args.ess_refresh_ratio), ess_refresh_count)
-                vec_cap = int(getattr(args, "num_envs", 8))
-                for off in range(0, len(early_stale_tids), max(1, vec_cap)):
-                    tids_slice = early_stale_tids[off: off + max(1, vec_cap)]
-                    cfgs = [MazeTaskManager.TaskConfig(**task_by_id[tid]["task_dict"]) for tid in tids_slice]
-                    seed_here = args.seed + 800000 + 1000 * b + off
-                    ro_list = collect_explore_vec(policy_net, cfgs, device, max_steps=250,
-                                                  seed_base=seed_here, dbg=False)
-                    for tid, ro_new in zip(tids_slice, ro_list):
-                        explore_cache[tid] = ro_new
-                        try:
-                            ro_new.reuse_count = 0
-                        except Exception:
-                            pass
-
-            # free forward tensors
+            # free PASS-1 tensors
             del exp_b, beh_b, act_b, logits_now_b
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            # PASS 2 — build per-task BC supervision tensors (using possibly refreshed rollouts)
+            # PASS 2 — build per-task BC supervision tensors (no in-batch recollects)
             per_task_tensors: Dict[int, Dict[str, torch.Tensor]] = {}
             tasks_used: List[int] = []
 
             for task in batch_tasks:
                 tid = task["task_id"]
                 ro = explore_cache.get(tid)
-                if ro is None:
-                    cfg = MazeTaskManager.TaskConfig(**task["task_dict"])
-                    ro = collect_explore_vec(policy_net, [cfg], device, max_steps=250,
-                                             seed_base=args.seed + 777777, dbg=False).pop()
-                    explore_cache[tid] = ro
 
                 exp_six_cpu = ro.obs6
                 actions_cpu = ro.actions
@@ -556,7 +470,6 @@ def run_training():
 
                 batch_obs_cpu, batch_lab_cpu = _pad_and_stack_cpu(demo_obs_list, demo_lab_list)
                 if getattr(args, "pin_memory", False):
-                    # Only pin short-lived batch tensors
                     batch_obs_cpu = batch_obs_cpu.pin_memory()
                     batch_lab_cpu = batch_lab_cpu.pin_memory()
 
@@ -567,7 +480,6 @@ def run_training():
                     "actions_cpu": actions_cpu,
                     "rewards_cpu": rewards_cpu,
                     "beh_logits_cpu": beh_logits_cpu,
-                    "ro": ro,
                     "task_dict": task["task_dict"],
                     "selected_paths": selected_paths,
                 }
@@ -576,7 +488,7 @@ def run_training():
             if len(tasks_used) == 0:
                 continue
 
-            # H2D copies on a dedicated stream
+            # H2D copies (and move FREE θ_init cache to device)
             if device.type == "cuda":
                 copy_stream = torch.cuda.Stream()
                 with torch.cuda.stream(copy_stream):
@@ -588,36 +500,39 @@ def run_training():
                         t["actions_dev"] = t["actions_cpu"].to(device, non_blocking=True)
                         t["rewards_dev"] = t["rewards_cpu"].to(device, non_blocking=True)
                         t["beh_logits_dev"] = t["beh_logits_cpu"].to(device, non_blocking=True)
+                        # FREE θ_init ref
+                        cached = lp_init_by_tid.get(tid, torch.empty((0,)))
+                        t["lp_init_dev"] = cached.to(device, non_blocking=True) if cached.numel() > 0 else torch.empty((0,), device=device)
                 torch.cuda.current_stream().wait_stream(copy_stream)
 
-            # Batch indicators (use stats from PASS 1)
+            # Batch indicators (from PASS 1)
             s_kl  = _stats_from_list(kls)
             s_ess = _stats_from_list(esss)
             s_rmu = _stats_from_list(rmu)
             s_rsd = _stats_from_list(rsd)
             s_rmx = _stats_from_list(rmx)
             logger.info(
-                "[IND][BATCH %d/%d] tasks=%d | %s | ESS:%s | rho(mean):%s rho(std):%s rho(max):%s | refresh: KL=%d ESS=%d",
+                "[IND][BATCH %d/%d] tasks=%d | %s | ESS:%s | rho(mean):%s rho(std):%s rho(max):%s",
                 b + 1, num_batches, len(tasks_used),
                 _fmt_stats("KL", s_kl), _fmt_stats("", s_ess),
                 _fmt_stats("", s_rmu), _fmt_stats("", s_rsd), _fmt_stats("", s_rmx),
-                kl_refresh_count, ess_refresh_count,
             )
 
             # =========================
-            # MRI OUTER LOOP (streamed backward)
+            # MRI OUTER LOOP (no mid-batch recollects)
             # =========================
+            # (micro-opt) names outside step loop
+            named_all = _named_trainable(policy_net)
+            adapt_names = [n for n in named_all.keys() if n not in _critic_param_names(policy_net)]
+
             for step_idx in range(args.nbc):
                 optimizer.zero_grad(set_to_none=True)
-
-                # names for inner updates (exclude critic head)
-                named_all = _named_trainable(policy_net)
-                adapt_names = [n for n in named_all.keys() if n not in _critic_param_names(policy_net)]
 
                 tasks_n = len(tasks_used)
                 total_bc_val = 0.0
                 total_corr_val = 0.0
                 pg_vals = []
+                ess_skips = 0  # count of tasks skipped by ESS gate
 
                 # running baseline if 'batch' is requested
                 batch_mean_bc = 0.0
@@ -629,23 +544,30 @@ def run_training():
                     rews_raw = t["rewards_dev"]
                     rews = torch.clamp(rews_raw * args.rew_scale, -args.rew_clip, args.rew_clip)
 
-                    # truncate explore window if needed
-                    if args.adapt_trunc_T is not None and isinstance(args.adapt_trunc_T, int) and exp.shape[0] > args.adapt_trunc_T:
-                        exp = exp[-args.adapt_trunc_T:]; acts = acts[-args.adapt_trunc_T:]; rews = rews[-args.adapt_trunc_T:]; beh  = beh[-args.adapt_trunc_T:]
+                    # truncate explore window if needed (keep θ_init cache aligned)
+                    adapt_T = getattr(args, "adapt_trunc_T", None)
+                    if isinstance(adapt_T, int) and adapt_T > 0 and exp.shape[0] > adapt_T:
+                        Tkeep = adapt_T
+                        exp = exp[-Tkeep:]; acts = acts[-Tkeep:]; rews = rews[-Tkeep:]; beh  = beh[-Tkeep:]
+                        if "lp_init_dev" in t and t["lp_init_dev"].shape[0] > 0:
+                            t["lp_init_dev"] = t["lp_init_dev"][-Tkeep:]
 
-                    # ----- Inner policy gradient steps (on θ) -----
+                    # ----- Inner policy gradient (with ESS gate) -----
                     params_k = OrderedDict((n, p) for n, p in named_all.items())
                     alpha = float(getattr(args, "inner_pg_alpha", 0.1))
+                    ess_min = float(getattr(args, "inner_ess_min", 0.0) or 0.0)
 
+                    # one (or few) inner steps
+                    do_skip = False
                     for k in range(int(getattr(args, "inner_steps", 1))):
                         with autocast(device_type="cuda", enabled=use_amp):
                             logits_seq, _ = _functional_call(policy_net, params_k, (exp.unsqueeze(0),))
                             logits_seq = logits_seq[0]
 
-                        # compute advantages with linear baseline
+                        # advantages with a tiny linear baseline
                         returns = discounted_returns(rews, args.gamma)
-                        T = returns.size(0)
-                        tt = torch.arange(T, device=returns.device, dtype=returns.dtype)
+                        Tlen = returns.size(0)
+                        tt = torch.arange(Tlen, device=returns.device, dtype=returns.dtype)
                         zt = (tt - tt.mean()) / tt.std().clamp_min(1e-6)
                         F = torch.stack([torch.ones_like(zt), zt], dim=1)
                         FT_F = F.T @ F + 1e-3 * torch.eye(2, device=returns.device, dtype=returns.dtype)
@@ -657,10 +579,28 @@ def run_training():
                         logp_cur = torch.log_softmax(logits_seq, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
 
                         if bool(getattr(args, "inner_use_is", False)):
-                            lp_beh = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
-                            rho = torch.exp(logp_cur.detach() - lp_beh)
+                            # θ_init reference (or fallback to behavior if empty)
+                            if t["lp_init_dev"].numel() > 0:
+                                lp_ref = t["lp_init_dev"]
+                            else:
+                                lp_ref = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+                            rho = torch.exp(logp_cur.detach() - lp_ref)
                             if getattr(args, "is_clip_rho", 0.0) > 0:
                                 rho = torch.clamp(rho, max=args.is_clip_rho)
+
+                            # ---- ESS gate (skip inner update if too low)
+                            if ess_min > 0.0:
+                                ess_now = ess_ratio_from_rhos(rho)
+                                if ess_now.item() < ess_min:
+                                    ess_skips += 1
+                                    pg_vals.append(0.0)
+                                    # Skip all inner updates for this task (φ=θ)
+                                    del logits_seq, returns, adv, adv_norm, logp_cur
+                                    if device.type == "cuda":
+                                        torch.cuda.empty_cache()
+                                    do_skip = True
+                                    break
+
                             inner_loss = - ((rho * logp_cur) * adv_norm).mean()
                         else:
                             inner_loss = - (logp_cur * adv_norm).mean()
@@ -690,47 +630,70 @@ def run_training():
                     bc_scalar_detached = float(loss_bc_phi.detach().item())
                     total_bc_val += bc_scalar_detached
 
-                    # ----- Meta-descent correction term (score-function) -----
+                    # ----- Meta-descent correction term (score-function, lower-variance) -----
                     corr_loss = 0.0
                     if bool(getattr(args, "meta_corr", False)):
                         with autocast(device_type="cuda", enabled=use_amp):
-                            logits_theta, _ = policy_net(exp.unsqueeze(0))   # θ at current (pre-update) params
+                            # IMPORTANT: use θ (outer params), not φ. policy_net is at θ here.
+                            logits_theta, _ = policy_net(exp.unsqueeze(0))
                             logits_theta = logits_theta[0]
                         logp_theta = torch.log_softmax(logits_theta, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
 
-                        # IS weights; multiplier detached where appropriate
+                        # --- Importance weights for correction (θ / reference), DETACHED ---
+                        w_imp = None
                         if bool(getattr(args, "meta_corr_use_is", False)):
-                            lp_beh = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
-                            w_imp = torch.exp(logp_theta.detach() - lp_beh)
+                            # Prefer θ_init reference if available; else fall back to behavior.
+                            if str(getattr(args, "inner_is_ref", "theta_init")) == "theta_init" and t.get("lp_init_dev", None) is not None and t["lp_init_dev"].numel() > 0:
+                                lp_ref = t["lp_init_dev"]
+                            else:
+                                lp_ref = torch.log_softmax(beh, dim=-1).gather(1, acts.unsqueeze(1)).squeeze(1)
+
+                            w_imp = torch.exp(logp_theta.detach() - lp_ref)        # detach reference path
                             if getattr(args, "is_clip_rho", 0.0) > 0:
                                 w_imp = torch.clamp(w_imp, max=args.is_clip_rho)
-                        else:
-                            w_imp = torch.ones_like(logp_theta)
 
+                            # Optional ESS gate for meta-corr (reuse inner_ess_min if no dedicated flag)
+                            ess_min_corr = float(getattr(args, "meta_corr_ess_min", getattr(args, "inner_ess_min", 0.0)) or 0.0)
+                            if ess_min_corr > 0.0:
+                                if ess_ratio_from_rhos(w_imp).item() < ess_min_corr:
+                                    # Skip correction when weights are too degenerate.
+                                    w_imp = None
+
+                        # --- Center log-probs (variance reduction) ---
                         if bool(getattr(args, "meta_corr_center_logp", False)):
-                            # detach the weighted mean so gradients don't flow through centering value
-                            wmean = ((w_imp * logp_theta).sum() / (w_imp.sum() + 1e-8)).detach()
+                            if w_imp is not None:
+                                wmean = ((w_imp * logp_theta).sum() / (w_imp.sum() + 1e-8)).detach()
+                            else:
+                                wmean = (logp_theta.mean()).detach()
                             logp_theta = logp_theta - wmean
 
-                        sum_logp = (w_imp.detach() * logp_theta).mean()
+                        # --- Weighted score; normalize by weight mass for stable scale ---
+                        if w_imp is not None:
+                            score = (w_imp.detach() * logp_theta).sum() / (w_imp.sum().detach() + 1e-8)
+                        else:
+                            score = logp_theta.mean()
+
                         coeff = float(getattr(args, "meta_corr_coeff", 1.0))
 
-                        # baseline selection in streaming mode
+                        # Baseline for (L_BC - b) — you already maintain batch/EMA outside
                         if str(getattr(args, "meta_corr_baseline", "batch")) == "ema":
                             bval = float(ema_baseline) if (ema_baseline is not None) else 0.0
-                        else:  # "batch": running mean of seen tasks
+                        elif str(getattr(args, "meta_corr_baseline", "batch")) == "batch":
                             bval = float(batch_mean_bc) if batch_seen > 0 else 0.0
+                        else:
+                            bval = 0.0
 
-                        corr_loss = - coeff * (loss_bc_phi.detach() - bval) * sum_logp
-                        total_corr_val += float(corr_loss.detach().item())
+                        # NOTE: detach L_BC so gradients only flow through logπ_θ
+                        corr_loss = - coeff * (loss_bc_phi.detach() - bval) * score
 
-                        del logits_theta, logp_theta, w_imp, sum_logp
+                        del logits_theta, logp_theta
 
-                    # ---- Stream backward now: free each task graph immediately ----
+
+                    # ---- Backward (streamed)
                     task_loss = loss_bc_phi + (corr_loss if bool(getattr(args, "meta_corr", False)) else 0.0)
                     scaler.scale(task_loss / tasks_n).backward()
 
-                    # update baselines after using bval
+                    # update baselines
                     if str(getattr(args, "meta_corr_baseline", "batch")) == "ema":
                         if ema_baseline is None:
                             ema_baseline = bc_scalar_detached
@@ -741,7 +704,13 @@ def run_training():
                         batch_seen += 1
                         batch_mean_bc = ((batch_seen - 1) * batch_mean_bc + bc_scalar_detached) / max(1, batch_seen)
 
-                    # Help GC
+                    # bookkeeping: count reuse
+                    try:
+                        rc = getattr(explore_cache[tid], "reuse_count", 0)
+                        explore_cache[tid].reuse_count = rc + 1
+                    except Exception:
+                        pass
+
                     del params_k, loss_bc_phi
 
                 # one optimizer step for the whole step_idx
@@ -753,143 +722,20 @@ def run_training():
                     logger.warning("[MRI][NONFINITE] grad_norm=%s — skipping optimizer step", str(grad_norm))
                     optimizer.zero_grad(set_to_none=True); scaler.update()
 
-                # bookkeeping
-                for tid in tasks_used:
-                    try:
-                        explore_cache[tid].reuse_count = getattr(explore_cache[tid], "reuse_count", 0) + 1
-                    except Exception:
-                        pass
-
                 running_bc += total_bc_val / max(1, tasks_n)
                 running_pg += (np.mean(pg_vals) if pg_vals else 0.0)
                 running_corr += (total_corr_val / max(1, tasks_n) if bool(getattr(args, "meta_corr", False)) else 0.0)
                 count_updates += 1
 
                 logger.info(
-                    "[MRI][STEP %d/%d] outer_BC=%.4f | inner_pg(mean)=%.4f | corr_loss=%.4f | grad_norm=%.3e",
+                    "[MRI][STEP %d/%d] outer_BC=%.4f | inner_pg(mean)=%.4f | corr_loss=%.4f | grad_norm=%.3e | ess_skips=%d",
                     step_idx + 1, args.nbc,
                     float(total_bc_val / max(1, tasks_n)),
                     float(np.mean(pg_vals) if pg_vals else 0.0),
                     float(total_corr_val / max(1, tasks_n) if bool(getattr(args, "meta_corr", False)) else 0.0),
                     float(grad_norm if torch.is_tensor(grad_norm) else grad_norm),
+                    int(ess_skips),
                 )
-
-                # --- Mid-batch staleness probe (KL/ESS) & targeted recollect (VECTORIZED) ---
-                probe_every = int(getattr(args, "stale_probe_every", 0) or 0)
-                probe_K     = int(getattr(args, "stale_probe_K", 0) or 0)
-                if probe_every > 0 and ((step_idx + 1) % probe_every == 0):
-                    tids_to_check = list(tasks_used)
-
-                    # Build selected (possibly truncated/subsampled) sequences per task
-                    exps_sel, behs_sel, acts_sel, lens_sel, task_order = [], [], [], [], []
-                    for tid in tids_to_check:
-                        t = per_task_tensors[tid]
-                        exp = t["exp_dev"]; beh = t["beh_logits_dev"]; act = t["actions_dev"]
-                        # mirror inner truncation if configured
-                        if args.adapt_trunc_T is not None and isinstance(args.adapt_trunc_T, int) and exp.shape[0] > args.adapt_trunc_T:
-                            exp = exp[-args.adapt_trunc_T:]; beh = beh[-args.adapt_trunc_T:]; act = act[-args.adapt_trunc_T:]
-                        Tlen = exp.shape[0]
-                        if Tlen == 0:
-                            continue
-                        if probe_K > 0 and Tlen > probe_K:
-                            idx = torch.randperm(Tlen, device=device)[:probe_K].sort()[0]
-                            exp = exp.index_select(0, idx)
-                            beh = beh.index_select(0, idx)
-                            act = act.index_select(0, idx)
-                            Tlen = exp.shape[0]
-                        exps_sel.append(exp); behs_sel.append(beh); acts_sel.append(act); lens_sel.append(Tlen); task_order.append(tid)
-
-                    if lens_sel:
-                        Bp = len(exps_sel)
-                        Tp = max(lens_sel)
-                        C, H, W = exps_sel[0].shape[1:]
-                        A = behs_sel[0].shape[1]
-                        exp_pb = torch.zeros(Bp, Tp, C, H, W, device=device)
-                        beh_pb = torch.zeros(Bp, Tp, A, device=device)
-                        act_pb = torch.full((Bp, Tp), -1, dtype=torch.long, device=device)
-                        for i in range(Bp):
-                            tlen = lens_sel[i]
-                            exp_pb[i, :tlen] = exps_sel[i]
-                            beh_pb[i, :tlen] = behs_sel[i]
-                            act_pb[i, :tlen] = acts_sel[i]
-
-                        with torch.no_grad(), autocast(device_type="cuda", enabled=use_amp):
-                            logits_now_b, _ = policy_net(exp_pb)  # (B,T,A)
-
-                        # Per-task KL/ESS and decision
-                        stale_tids: List[int] = []
-                        bad_kl = 0; bad_ess = 0
-                        for i, tid in enumerate(task_order):
-                            tlen = lens_sel[i]
-                            li = logits_now_b[i, :tlen]
-                            bi = beh_pb[i, :tlen]
-                            ai = act_pb[i, :tlen]
-
-                            lp_now = torch.log_softmax(li, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)
-                            lp_beh = torch.log_softmax(bi, dim=-1).gather(1, ai.unsqueeze(1)).squeeze(1)
-                            rhos   = torch.exp(lp_now - lp_beh)
-                            if getattr(args, "is_clip_rho", 0.0) > 0:
-                                rhos = torch.clamp(rhos, max=args.is_clip_rho)
-                            ess_ratio_val = ess_ratio_from_rhos(rhos).item()
-                            kl_val = mean_kl_logits(li, bi).item()
-
-                            flag_kl  = (kl_val > args.kl_refresh_threshold)
-                            flag_ess = (args.ess_refresh_ratio and args.ess_refresh_ratio > 0 and ess_ratio_val < args.ess_refresh_ratio)
-                            if flag_kl or flag_ess:
-                                stale_tids.append(tid)
-                                bad_kl  += int(flag_kl)
-                                bad_ess += int(flag_ess)
-
-                        if stale_tids:
-                            logger.info("[MIDPROBE][RECOLLECT] epoch=%d batch=%d step=%d probe_every=%d K=%d | stale=%d (KL>%g: %d, ESS<%g: %d)",
-                                        epoch, b + 1, step_idx + 1, probe_every, probe_K,
-                                        len(stale_tids), float(args.kl_refresh_threshold), bad_kl,
-                                        float(args.ess_refresh_ratio), bad_ess)
-                            vec_cap = int(getattr(args, "num_envs", 8))
-                            for off in range(0, len(stale_tids), max(1, vec_cap)):
-                                tids_slice = stale_tids[off : off + max(1, vec_cap)]
-                                cfgs = [MazeTaskManager.TaskConfig(**per_task_tensors[tid]["task_dict"]) for tid in tids_slice]
-                                seed_here = args.seed + 100000 * epoch + 1000 * b + (step_idx + 1) * 123 + off
-                                ro_list = collect_explore_vec(policy_net, cfgs, device, max_steps=250, seed_base=seed_here, dbg=False)
-                                for tid, ro_new in zip(tids_slice, ro_list):
-                                    explore_cache[tid] = ro_new
-                                    try:
-                                        ro_new.reuse_count = 0
-                                    except Exception:
-                                        pass
-                                    per_task_tensors[tid] = _rebuild_task_entry_from_ro(
-                                        per_task_tensors[tid], ro_new, device, args, npz_cache
-                                    )
-
-                        # free batch probes
-                        del exp_pb, beh_pb, act_pb, logits_now_b
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
-
-                # --- Mid-batch vectorized recollect to enforce the reuse budget ---
-                reuse_budget = max(1, int(getattr(args, "explore_reuse_M", 1)))
-                if (step_idx + 1) % reuse_budget == 0:
-                    vec_cap = int(getattr(args, "num_envs", 8))
-                    for off in range(0, len(tasks_used), max(1, vec_cap)):
-                        tids_slice = tasks_used[off : off + max(1, vec_cap)]
-                        cfgs = [MazeTaskManager.TaskConfig(**per_task_tensors[tid]["task_dict"]) for tid in tids_slice]
-                        seed_here = args.seed + 100000 * epoch + 1000 * b + (step_idx + 1) + off
-                        ro_list = collect_explore_vec(policy_net, cfgs, device, max_steps=250, seed_base=seed_here, dbg=False)
-                        for tid, ro_new in zip(tids_slice, ro_list):
-                            explore_cache[tid] = ro_new
-                            try:
-                                ro_new.reuse_count = 0
-                            except Exception:
-                                pass
-                            # Rebuild this task's tensors against the fresh explore rollout
-                            per_task_tensors[tid] = _rebuild_task_entry_from_ro(
-                                per_task_tensors[tid], ro_new, device, args, npz_cache
-                            )
-
-                # Step-level cleanup
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-                gc.collect()
 
             # ----- End of batch cleanup -----
             per_task_tensors.clear()
@@ -939,12 +785,14 @@ def run_training():
     cpu_pool.shutdown(wait=True)
     logger.info("BC meta training complete.")
 
+
 def _safe_npz_load_obs_acts(path: str) -> Tuple[str, Optional[np.ndarray], Optional[np.ndarray]]:
     try:
         d = np.load(path)
         return path, d["observations"], d["actions"]
     except Exception:
         return path, None, None
+
 
 if __name__ == "__main__":
     run_training()
